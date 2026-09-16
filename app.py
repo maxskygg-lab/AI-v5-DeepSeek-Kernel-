@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import os, time, tempfile, re, math, uuid, itertools, io
 import arxiv, requests
-import numpy as np # <--- 【修改点 1：新增 numpy 库，用于在内存中进行高效的向量矩阵余弦相似度计算】
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from streamlit_agraph import agraph, Node, Edge, Config
@@ -128,6 +127,8 @@ defaults = {
     "pending_note":           None,
     "graph_references_cache": [],
     "preload_done_ids":       set(),
+    "trackers":               {},
+    "tracker_total_new":      0,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -182,7 +183,6 @@ def convert_to_excel(results):
             "引用数": item.get('citations', 0),
             "核心贡献 (AI)": contrib,
             "综合评分 (AI)": score,  # --- 修改点 1：将打分情况塞进 Excel 的行数据里 ---
-            "真实语义相似度": round(item.get('sim_score', 0), 2), # <--- 【修改点 2：在导出的 Excel 中新增“真实语义相似度”列，保留两位小数】
             "链接": res.entry_id,
             "摘要": res.summary.replace('\n', ' ')
         })
@@ -205,9 +205,8 @@ def convert_to_excel(results):
         worksheet.set_column('E:E', 50, cell_fmt)
         # --- 修改点 1：新增第F列留给综合评分，把原来的G列、H列顺延排好防挤压 ---
         worksheet.set_column('F:F', 30, cell_fmt)
-        worksheet.set_column('G:G', 15, num_fmt) # <--- 【修改点 2：为新增的真实语义相似度列调整列宽和格式】
-        worksheet.set_column('H:H', 30, cell_fmt)
-        worksheet.set_column('I:I', 60, cell_fmt)
+        worksheet.set_column('G:G', 30, cell_fmt)
+        worksheet.set_column('H:H', 60, cell_fmt)
         
         for col_num, value in enumerate(df.columns.values):
             worksheet.write(0, col_num, value, header_fmt)
@@ -360,7 +359,7 @@ def get_paper_score(arxiv_id, title, abstract, api_key, ss_key):
     # 此处已移除对 st.session_state 的直接读写，变为纯函数，防止多线程崩溃
     try:
         clean_id = get_pure_arxiv_id(arxiv_id)
-        # 向 Semantic Scholar 请求时增加了 year 字段，获取真实发表年份
+        # --- 核心打分标尺修改点 1：向 Semantic Scholar 请求增加 'year' 字段 ---
         url = f"https://api.semanticscholar.org/graph/v1/paper/ArXiv:{clean_id}?fields=tldr,influentialCitationCount,year"
         headers = {"x-api-key": ss_key} if ss_key else {}
         ss_info = ""
@@ -370,31 +369,34 @@ def get_paper_score(arxiv_id, title, abstract, api_key, ss_key):
                 data = r.json()
                 tldr = data.get("tldr", {}).get("text", "无") if data.get("tldr") else "无"
                 inf_cites = data.get("influentialCitationCount", 0)
-                pub_year = data.get("year", "未知年份")
-                ss_info = f"\n\n【Semantic Scholar 真实辅助数据】\n- 发表年份: {pub_year}\n- 极具影响力引用数: {inf_cites}\n- 官方TLDR摘要: {tldr}"
+                pub_year = data.get("year", "未知")
+                ss_info = f"\n\nSemantic Scholar真实数据：\n- 发表年份: {pub_year}\n- 极具影响力引用数: {inf_cites}\n- TLDR极简摘要: {tldr}"
         except: pass
 
-        # 锁定 temperature 为 0.0，杜绝大模型随机性，严格执行量表
+        # --- 核心打分标尺修改点 2：将温度值强制设为 0.0 锁死随机性 ---
         llm = get_deepseek_llm(api_key, temperature=0.0)
-        # --- 修改点：优化打分 prompt，缓和极端低分，提高区分度以解决分数雷同问题 ---
+        
+        # --- 核心打分标尺修改点 3：部署硬性计算公式 Prompt ---
         prompt = (
-            f"你现在是一位顶尖人工智能领域的资深论文导师。请你结合给定信息，客观且富有区分度地对这篇论文进行综合打分（满分100分）。\n"
-            f"当前的打分常常偏低且雷同，请仔细发掘论文的细节和创新点，充分利用整个分数段（不要刻意压低分数），拉开合理的差距。\n\n"
-            f"【学术打分量表（满分100）】：\n"
-            f"1. 核心创新与突破性 (40分)：\n"
-            f"   - 35-40分：提出颠覆性架构或解决领域重大难题。\n"
-            f"   - 28-34分：有扎实的创新点，对SOTA有显著改进，或提供高价值数据集。\n"
-            f"   - 20-27分：常规的渐进式改进，逻辑自洽，具备一定的实用价值。\n"
-            f"   - 0-19分：创新性较弱，单纯的模块拼接或方法套用。\n"
-            f"2. 方法严谨度与可信度 (30分)：\n"
-            f"   - 25-30分：摘要明确列出量化指标、对比了强基线，提及开源或详尽实验验证。\n"
-            f"   - 18-24分：提到实验效果提升，有合理的数据支持，但描述偏向概括。\n"
-            f"   - 0-17分：缺乏具体数据指标支撑，结论偏主观或含糊。\n"
-            f"3. 学术影响力与时效潜力 (30分)：\n"
-            f"   - 综合发表年份、引用量（如有）以及研究方向的前沿热门程度给分。高引或极具潜力的热门方向给 22-30分；常规方向或普通跟进型研究给 15-21分；冷门且低引给0-14分。\n\n"
-            f"【最终定档与输出规范】：\n"
-            f"禁止输出计算过程、禁止输出拆项得分。只允许输出一行字：\n"
-            f"【xx分】导师点评：一句话犀利指出核心优缺点（需一针见血，不超过30个汉字）。\n\n"
+            f"你是一个冷酷、严谨的学术打分机器。请严格按照以下【量化评分标准】对论文进行打分（满分100分）。\n"
+            f"为了保证每次打分绝对一致，请你严格依据文本执行加减分，禁止任何主观臆测：\n\n"
+            f"【量化评分标准（总分100）】：\n"
+            f"1. 基础客观影响力（40分）：\n"
+            f"   - 若无年份数据或极具影响力引用数（视为0处理）。\n"
+            f"   - 若发表年份在 2024、2025、2026年（最新论文）：默认给35分基础分（容忍低引用），极具影响力引用每多1个加1分，最高上限40分。\n"
+            f"   - 若发表年份在 2023年及以前：极具影响力引用数 ≥ 50 给40分；≥ 10 给30分；≥ 1 给20分；0引用 给10分。\n"
+            f"2. 问题价值与创新性（30分）：\n"
+            f"   - 摘要或TLDR中明确使用了诸如'novel', 'first', 'new', 'introduce'等词汇提出全新视角的：得30分。\n"
+            f"   - 提出了已有方法的改进（'improve', 'better', 'extend'等）或新应用场景的：得20分。\n"
+            f"   - 常规研究、仅做综述或缺乏明确创新点的：得10分。\n"
+            f"3. 方案与结果的详实度（30分）：\n"
+            f"   - 摘要中同时包含【明确的模型/方法】+【具体的量化数据指标（如提升了xx%、达到了xx准确率）】：得30分。\n"
+            f"   - 仅提到方法但缺乏具体结果量化数据的：得20分。\n"
+            f"   - 描述笼统，完全缺乏具体技术细节的：得10分。\n\n"
+            f"【输出要求】：\n"
+            f"必须严格按照以下格式输出，禁止输出你的计算过程或其他多余的废话：\n"
+            f"【xx分】一句话理由（需指出该分数维度的核心原因，不超过30个字）。\n\n"
+            f"【论文信息】：\n"
             f"标题：{title}\n摘要：{abstract[:600]}{ss_info}"
         )
         res = llm.invoke(prompt)
@@ -475,6 +477,61 @@ def get_gap_recommendations():
     return [r for r in st.session_state.graph_references_cache
             if not any(r.get("title","")[:20].lower() in f.lower() for f in loaded)][:4]
 
+# ── 关键词追踪 ──
+def tracker_check_one(keyword: str, since_date: str | None = None) -> list:
+    try:
+        cutoff = datetime.fromisoformat(since_date) if since_date else datetime.now() - timedelta(days=7)
+        refined = keyword
+        if " " in keyword and "AND" not in keyword and '"' not in keyword:
+            refined = " AND ".join([f'(ti:{w} OR abs:{w})' for w in keyword.split()])
+        results = list(arxiv.Search(
+            query=refined, max_results=30,
+            sort_by=arxiv.SortCriterion.SubmittedDate
+        ).results())
+        out = []
+        for r in results:
+            if r.published.replace(tzinfo=None) > cutoff:
+                out.append({
+                    "title":     r.title,
+                    "authors":   ", ".join([a.name for a in r.authors]),
+                    "published": r.published.strftime("%Y-%m-%d"),
+                    "summary":   r.summary,
+                    "entry_id":  r.entry_id,
+                    "obj":       r,
+                })
+        return out
+    except Exception as e:
+        st.warning(f"追踪「{keyword}」时出错: {e}"); return []
+
+def tracker_run_all(force=False):
+    if not st.session_state.trackers: return
+    now = datetime.now()
+    total = 0
+    for kw, data in st.session_state.trackers.items():
+        last = data.get("last_checked")
+        ih   = data.get("check_interval_h", 12)
+        if not force and last:
+            elapsed = (now - datetime.fromisoformat(last)).total_seconds() / 3600
+            if elapsed < ih:
+                total += len(data.get("new_papers",[])); continue
+        new = tracker_check_one(kw, since_date=data.get("last_checked"))
+        seen = set(data.get("seen_ids",[]))
+        truly_new = [p for p in new if p["entry_id"] not in seen]
+        data["new_papers"]   = truly_new + data.get("new_papers",[])
+        data["last_checked"] = now.isoformat(timespec="seconds")
+        total += len(data["new_papers"])
+    st.session_state.tracker_total_new = total
+
+def tracker_mark_read(keyword: str):
+    data = st.session_state.trackers.get(keyword, {})
+    for p in data.get("new_papers",[]): data.setdefault("seen_ids",[]).append(p["entry_id"])
+    data["new_papers"] = []
+    st.session_state.tracker_total_new = sum(
+        len(d.get("new_papers",[])) for d in st.session_state.trackers.values()
+    )
+
+if st.session_state.trackers:
+    tracker_run_all(force=False)
 
 # ================= 5. 图谱渲染 =================
 def render_connected_graph(data, min_cite_filter=0):
@@ -608,9 +665,11 @@ with st.sidebar:
             os.remove(path); st.rerun()
 
 # ================= 7. 主界面 =================
+_n_new = st.session_state.tracker_total_new
+_track_label = f"🔔 追踪提醒 ({_n_new} 新)" if _n_new > 0 else "🔔 关键词追踪"
 
-tab_main, tab_read, tab_notes = st.tabs([
-    "🔍 学术检索 & 图谱", "📖 研读空间", "📌 我的笔记"
+tab_main, tab_read, tab_track, tab_notes = st.tabs([
+    "🔍 学术检索 & 图谱", "📖 研读空间", _track_label, "📌 我的笔记"
 ])
 
 # ══════════════════════════════════════════
@@ -619,29 +678,12 @@ tab_main, tab_read, tab_notes = st.tabs([
 with tab_main:
     st.markdown('<div class="section-divider">🌍 学术检索</div>', unsafe_allow_html=True)
     
-    # --- 修改点：恢复两列布局，去掉独立的下拉框 ---
     sq1,sq2 = st.columns([4,2])
     with sq1:
         search_query = st.text_input("关键词", value=st.session_state.suggested_query,
                                      placeholder="输入关键词，例如: education robot", label_visibility="collapsed")
     with sq2:
         sort_mode = st.selectbox("排序",["🔥 相关性", "🌟 综合(相关+质量)", "💎 质量优先", "📅 最新", "📈 引用量"], label_visibility="collapsed")
-
-    # --- 修改点开始：将固定下拉框改为动态任意比例滑块，并与左侧模式深度绑定 ---
-    rel_w = 1.0
-    qual_w = 0.0
-    if sort_mode in ["🌟 综合(相关+质量)", "💎 质量优先"]:
-        # 根据选择的模式，给予不同的初始滑块位置（综合默认60%，质量优先默认20%）
-        default_rel = 60 if "综合" in sort_mode else 20
-        rel_weight_pct = st.slider(
-            "⚖️ 自定义权重配比 (任意调节，左拉看重质量，右拉看重相关性)",
-            min_value=0, max_value=100, value=default_rel, step=1,
-            format="相关性 %d%%"
-        )
-        rel_w = rel_weight_pct / 100.0
-        qual_w = 1.0 - rel_w
-        st.caption(f"💡 当前计算规则：总分 = (真实语义分 × **{rel_w:.2f}**) + (AI质量分 × **{qual_w:.2f}**)") # <--- 【修改点 3：更新提示文案】
-    # --- 修改点结束 ---
 
     with st.expander("⚙️ 高级筛选 (学科/期刊)"):
         adv1, adv2 = st.columns(2)
@@ -707,30 +749,6 @@ with tab_main:
                     st.warning("⚠️ 未找到匹配论文。建议：1. 缩减关键词 2. 清空‘期刊名称’筛选框 3. 检查学科分类是否选错。")
                 
                 st.session_state.search_results = [{"obj":r,"citations":None} for r in raw]
-                
-                # <--- 【修改点 4：在此处批量计算这 100 篇论文与关键词的真实语义余弦相似度】 --->
-                if st.session_state.search_results:
-                    with st.spinner("正在利用本地向量模型进行底层语义匹配打分..."):
-                        try:
-                            embeddings_model = get_embeddings_model()
-                            # 1. 向量化用户搜索词
-                            query_vec = np.array(embeddings_model.embed_query(search_query))
-                            # 2. 批量提取摘要并向量化
-                            abstracts = [item['obj'].summary for item in st.session_state.search_results]
-                            doc_vecs = np.array(embeddings_model.embed_documents(abstracts))
-                            # 3. 计算余弦相似度公式: (A·B) / (||A|| * ||B||)
-                            norms_doc = np.linalg.norm(doc_vecs, axis=1)
-                            norm_query = np.linalg.norm(query_vec)
-                            similarities = np.dot(doc_vecs, query_vec) / (norms_doc * norm_query)
-                            # 4. 将真实分数转为百分制并写回字典
-                            for idx, item in enumerate(st.session_state.search_results):
-                                item['sim_score'] = float(similarities[idx]) * 100 
-                        except Exception as e:
-                            st.warning(f"本地语义计算异常，将降级使用基础分: {e}")
-                            for item in st.session_state.search_results:
-                                item['sim_score'] = 50.0 # 失败兜底分
-                # <--- 【修改点 4 结束】 --->
-
                 st.session_state.citations_loaded = False
                 st.session_state.contributions_cache = {}
                 st.session_state.focus_paper_id = None
@@ -745,35 +763,51 @@ with tab_main:
                 
                 if "引用量" in sort_mode:
                     st.session_state.search_results.sort(key=lambda x: x["citations"] or 0, reverse=True)
-                elif "质量优先" in sort_mode or "综合" in sort_mode:
+                elif "质量优先" in sort_mode:
                     import math
                     current_year = datetime.now().year
                     for idx, item in enumerate(st.session_state.search_results):
-                        # <--- 【修改点 5：废弃伪相关性硬编码（if idx < 10 等），直接读取真实向量匹配分】 --->
-                        rel_score = item.get('sim_score', 50.0)
+                        # 引入基础相关性兜底 (20%权重)，防止无关的超高引文霸榜
+                        if idx < 10: rel_score = 100
+                        elif idx < 20: rel_score = 85
+                        elif idx < 30: rel_score = 70
+                        else: rel_score = 50
                         
                         cites = item["citations"] or 0
                         cite_score = (math.log10(cites + 1) / 3.0) * 100
                         
                         pub_year = item['obj'].published.year
                         age = max(0, current_year - pub_year)
+                        time_bonus = 0
+                        if age == 0: time_bonus = 40
+                        elif age == 1: time_bonus = 20
+                        elif age == 2: time_bonus = 10
                         
-                        # 针对不同模式计算时效补偿
-                        if "质量优先" in sort_mode:
-                            time_bonus = 0
-                            if age == 0: time_bonus = 40
-                            elif age == 1: time_bonus = 20
-                            elif age == 2: time_bonus = 10
-                        else:
-                            time_bonus = max(0, 30 - age * 10)
-                            
                         quality_score = min(100.0, cite_score + time_bonus)
-                        
-                        # 融合真实语义分与质量分
-                        item["total_score"] = (rel_score * rel_w) + (quality_score * qual_w)
-                        
+                        # 质量绝对主导(80%)，但必须有相关性(20%)作为约束
+                        item["total_score"] = (rel_score * 0.2) + (quality_score * 0.8)
                     st.session_state.search_results.sort(key=lambda x: x.get("total_score", 0), reverse=True)
-                # <--- 【修改点 5 结束】 --->
+                elif "综合" in sort_mode:
+                    import math
+                    current_year = datetime.now().year
+                    max_items = len(st.session_state.search_results)
+                    for idx, item in enumerate(st.session_state.search_results):
+                        if idx < 10: rel_score = 100
+                        elif idx < 20: rel_score = 85
+                        elif idx < 30: rel_score = 70
+                        else: rel_score = 50
+
+                        cites = item["citations"] or 0
+                        cite_score = (math.log10(cites + 1) / 3.0) * 100
+                        
+                        pub_year = item['obj'].published.year
+                        age = max(0, current_year - pub_year)
+                        time_bonus = max(0, 30 - age * 10)
+                        
+                        quality_score = min(100.0, cite_score + time_bonus)
+                        item["total_score"] = (rel_score * 0.6) + (quality_score * 0.4)
+                    
+                    st.session_state.search_results.sort(key=lambda x: x.get("total_score", 0), reverse=True)
                 
                 st.session_state.citations_loaded = True
             
@@ -866,7 +900,6 @@ with tab_main:
             unsafe_allow_html=True
         )
 
-        # --- 修改点开始：将下载和打分按钮重构为三列，加入动态数量输入，并新增打包下载 PDF 功能 ---
         col_excel, col_score, col_pdf = st.columns(3)
         
         with col_excel:
@@ -910,16 +943,11 @@ with tab_main:
                 dl_end = st.number_input("到第", min_value=dl_start, max_value=max(dl_start, len(st.session_state.search_results)), value=max(dl_start, min(dl_start + 9, len(st.session_state.search_results))), step=1, key="batch_dl_end")
             
             if st.button(f"🔄 打包 ZIP ({dl_start}-{dl_end} 篇)", use_container_width=True):
-                # ==========================
-                # --- 新修改点：重构打包逻辑，开启真实硬盘流式传输，彻底防止内存崩溃 ---
-                # ==========================
                 import zipfile
-                # 使用硬盘临时文件替代内存缓冲
                 temp_zip_path = os.path.join(tempfile.gettempdir(), f"arxiv_batch_{uuid.uuid4().hex[:8]}.zip")
                 to_dl = st.session_state.search_results[dl_start-1 : dl_end]
                 dl_total = len(to_dl)
                 
-                # 使用状态文本与进度条，保证网页实时与后台通讯
                 status_text = st.empty()
                 progress_bar = st.progress(0)
                 
@@ -928,29 +956,21 @@ with tab_main:
                         res = item['obj']
                         status_text.text(f"📥 正在提取并压缩 ({idx+1}/{dl_total}): {res.title[:25]}...")
                         try:
-                            # 增加 1.5 秒安全休眠，防高并发触发 ArXiv 的防 DDoS 封锁
                             time.sleep(1.5)
                             p_path = download_arxiv_pdf_direct(res.entry_id)
                             safe_title = re.sub(r'[\\/*?:"<>|]', "", res.title)[:50]
-                            # 文件名加上原始排名序号，方便对应
                             filename = f"{dl_start + idx}_{safe_title}.pdf"
                             zf.write(p_path, arcname=filename)
                             os.remove(p_path) 
                         except Exception as e:
                             pass 
-                        # 每次循环更新进度，维持前端存活
                         progress_bar.progress((idx + 1) / dl_total)
                 
                 status_text.text("✅ 打包完成！正在生成最终下载链接...")
                 
-                # 保留文件路径，而不是将几百兆数据塞进内存变量
                 st.session_state.ready_zip_path = temp_zip_path
                 st.session_state.ready_zip_name = f"ArXiv_PDFs_{dl_start}to{dl_end}_{datetime.now().strftime('%m%d_%H%M')}.zip"
-                # ==========================
-                # --- 新修改点结束 ---
-                # ==========================
             
-            # 如果缓存里有打包好的文件路径，打开文件流供按钮下载，零内存占用！
             if st.session_state.get("ready_zip_path") and os.path.exists(st.session_state.get("ready_zip_path")):
                 with open(st.session_state.ready_zip_path, "rb") as f:
                     st.download_button(
@@ -961,7 +981,6 @@ with tab_main:
                         use_container_width=True,
                         type="primary"
                     )
-        # --- 修改点结束 ---
         
         st.markdown("---")
         
@@ -971,11 +990,9 @@ with tab_main:
             cite_html = (f"<span class='cite-badge'>{cites}</span>" if cites is not None
                          else "<span class='cite-loading'>加载中…</span>")
             with st.expander(f"#{i+1} {res.title} ({res.published.year})"):
-                # <--- 【修改点 6：在每篇论文展开的标题栏，同时显示刚刚算出来的真实向量分数】 --->
-                sim_display = f" | 🎯 匹配度: {round(item.get('sim_score', 0), 1)}%"
                 st.markdown(
                     f"**{', '.join([a.name for a in res.authors])}** | "
-                    f"{res.published.strftime('%Y-%m-%d')} | 引用：{cite_html}{sim_display}",
+                    f"{res.published.strftime('%Y-%m-%d')} | 引用：{cite_html}",
                     unsafe_allow_html=True
                 )
                 ck = res.title[:60]
@@ -1019,30 +1036,11 @@ with tab_main:
         
     if st.session_state.search_generator:
         st.markdown("---")
-        # --- 修改点：按钮文案同步修改为 100 篇 ---
         if st.button("🔽 加载更多 100 篇...", use_container_width=True):
-            with st.spinner("正在拉取新论文摘要并计算语义分数..."):
-                # --- 修改点：每次额外拉取数量提升到 100 ---
+            with st.spinner("正在拉取新论文摘要..."):
                 more_raw = list(itertools.islice(st.session_state.search_generator, 100))
                 if more_raw:
                     new_results = [{"obj": r, "citations": None} for r in more_raw]
-                    
-                    # <--- 【修改点 7：在“加载更多”时，也必须对这新来的 100 篇计算真实的语义分数】 --->
-                    try:
-                        embeddings_model = get_embeddings_model()
-                        query_vec = np.array(embeddings_model.embed_query(search_query))
-                        abstracts = [item['obj'].summary for item in new_results]
-                        doc_vecs = np.array(embeddings_model.embed_documents(abstracts))
-                        norms_doc = np.linalg.norm(doc_vecs, axis=1)
-                        norm_query = np.linalg.norm(query_vec)
-                        similarities = np.dot(doc_vecs, query_vec) / (norms_doc * norm_query)
-                        for idx, item in enumerate(new_results):
-                            item['sim_score'] = float(similarities[idx]) * 100 
-                    except Exception as e:
-                        for item in new_results:
-                            item['sim_score'] = 50.0 
-                    # <--- 【修改点 7 结束】 --->
-
                     id2c = smart_fetch_citations(new_results, ss_key=ss_api_key)
                     for item in new_results:
                         item["citations"] = id2c.get(item['obj'].entry_id, 0)
@@ -1050,29 +1048,47 @@ with tab_main:
                     
                     if "引用量" in sort_mode:
                         st.session_state.search_results.sort(key=lambda x: x["citations"] or 0, reverse=True)
-                    elif "质量优先" in sort_mode or "综合" in sort_mode:
+                    elif "质量优先" in sort_mode:
                         import math
                         current_year = datetime.now().year
                         for idx, item in enumerate(st.session_state.search_results):
-                            # <--- 【修改点 8：废弃伪相关性，应用真实分数】 --->
-                            rel_score = item.get('sim_score', 50.0)
+                            if idx < 10: rel_score = 100
+                            elif idx < 20: rel_score = 85
+                            elif idx < 30: rel_score = 70
+                            else: rel_score = 50
                             
                             cites = item["citations"] or 0
                             cite_score = (math.log10(cites + 1) / 3.0) * 100
                             
                             pub_year = item['obj'].published.year
                             age = max(0, current_year - pub_year)
+                            time_bonus = 0
+                            if age == 0: time_bonus = 40
+                            elif age == 1: time_bonus = 20
+                            elif age == 2: time_bonus = 10
                             
-                            if "质量优先" in sort_mode:
-                                time_bonus = 0
-                                if age == 0: time_bonus = 40
-                                elif age == 1: time_bonus = 20
-                                elif age == 2: time_bonus = 10
-                            else:
-                                time_bonus = max(0, 30 - age * 10)
-                                
                             quality_score = min(100.0, cite_score + time_bonus)
-                            item["total_score"] = (rel_score * rel_w) + (quality_score * qual_w)
+                            item["total_score"] = (rel_score * 0.2) + (quality_score * 0.8)
+                        st.session_state.search_results.sort(key=lambda x: x.get("total_score", 0), reverse=True)
+                    elif "综合" in sort_mode:
+                        import math
+                        current_year = datetime.now().year
+                        max_items = len(st.session_state.search_results)
+                        for idx, item in enumerate(st.session_state.search_results):
+                            if idx < 10: rel_score = 100
+                            elif idx < 20: rel_score = 85
+                            elif idx < 30: rel_score = 70
+                            else: rel_score = 50
+                            
+                            cites = item["citations"] or 0
+                            cite_score = (math.log10(cites + 1) / 3.0) * 100
+                            
+                            pub_year = item['obj'].published.year
+                            age = max(0, current_year - pub_year)
+                            time_bonus = max(0, 30 - age * 10)
+                            
+                            quality_score = min(100.0, cite_score + time_bonus)
+                            item["total_score"] = (rel_score * 0.6) + (quality_score * 0.4)
                             
                         st.session_state.search_results.sort(key=lambda x: x.get("total_score", 0), reverse=True)
                     st.rerun()
@@ -1084,13 +1100,10 @@ with tab_main:
 # Tab 2：研读空间
 # ══════════════════════════════════════════
 with tab_read:
-    # --- 1. 顶部控制栏：精准控制 Scope ---
     t = active_topic_data()
     
-    # 布局：左侧选模式，右侧状态显示
     c_ctrl, c_info = st.columns([2, 3])
     with c_ctrl:
-        # 核心修改：明确的范围选择，不再默认全库检索
         scope_options = ["🌐 全库综合 (对比/综述)"] + t["files"]
         selected_scope = st.selectbox(
             "📚 阅读范围 (Scope)", 
@@ -1099,7 +1112,6 @@ with tab_read:
             help="选择“全库”进行跨论文对比；选择“单篇”将只检索该论文内容，更省 Token 且更精准。"
         )
     with c_info:
-        # 显示当前 Token 使用情况预估或入库状态
         if selected_scope == "🌐 全库综合 (对比/综述)":
             st.caption(f"🚀 当前模式：检索所有 {len(t['files'])} 篇论文")
         else:
@@ -1107,9 +1119,7 @@ with tab_read:
 
     st.divider()
 
-    # --- 2. 聊天历史回显 (原生组件) ---
     if not st.session_state.chat_history:
-        # 欢迎引导语
         with st.chat_message("assistant"):
             st.markdown(f"👋 我是你的 DeepSeek 研读助手。当前主题库中有 **{len(t['files'])}** 篇论文。")
             if t["files"]:
@@ -1119,30 +1129,23 @@ with tab_read:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # --- 3. 聊天输入与处理 ---
     if prompt := st.chat_input("输入问题..."):
-        # 0. 检查是否有库
         if not t["db"]:
             st.error("请先在左侧上传 PDF 或从检索页下载论文入库！")
             st.stop()
 
-        # 1. 用户消息上屏
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # 2. AI 生成回答
         with st.chat_message("assistant"):
-            # 占位符用于流式输出
             message_placeholder = st.empty()
             full_response = ""
             
             try:
-                # --- 核心优化 A：精准检索策略 ---
                 search_kwargs = {}
                 filter_rule = None
                 
-                # 如果选择了特定论文，构建 metadata 过滤器
                 if selected_scope != "🌐 全库综合 (对比/综述)":
                     filter_rule = {"source_paper": selected_scope}
                     search_kwargs = {"k": 20, "filter": filter_rule}
@@ -1152,21 +1155,17 @@ with tab_read:
                     status_text = f"🔍 正在全库 {len(t['files'])} 篇论文中检索..."
 
                 with st.spinner(status_text):
-                    # 执行检索
                     if filter_rule:
                         docs = t["db"].similarity_search(prompt, **search_kwargs)
-                        # --- 修改点：单篇模式下，额外获取 SS 真实元数据以增强问答 ---
                         ss_data = fetch_ss_paper_details_by_title(selected_scope, ss_api_key)
                     else:
                         docs = t["db"].max_marginal_relevance_search(prompt, **search_kwargs)
                         ss_data = None
 
-                # --- 核心优化 B：构建更智能的 Prompt ---
                 if not docs:
                     full_response = "⚠️ 未在文档中检索到相关信息，请尝试更换关键词或检查文档是否完整。"
                     message_placeholder.markdown(full_response)
                 else:
-                    # 整理上下文，带上来源标记
                     context_text = ""
                     refs = []
                     for i, d in enumerate(docs):
@@ -1176,7 +1175,6 @@ with tab_read:
                         context_text += f"[资料{i+1} | {src} (P{page})]: {snippet}\n\n"
                         refs.append(f"**[{i+1}] {src} (P{page})**: {snippet[:100]}...")
                         
-                    # --- 修改点：如果获取到了 SS 真实数据，注入给 LLM ---
                     ss_context = ""
                     if ss_data:
                         tldr = ss_data.get('tldr', {}).get('text', '无') if ss_data.get('tldr') else '无'
@@ -1191,7 +1189,6 @@ with tab_read:
                             f"**指令**：你在回答背景、影响力和核心结论时，必须优先以这部分的真实元数据为准，不要编造不存在的事实。\n"
                         )
 
-                    # 动态 System Prompt
                     if selected_scope != "🌐 全库综合 (对比/综述)":
                         sys_prompt = (
                             f"你正在辅助用户精读论文《{selected_scope}》。\n"
@@ -1211,7 +1208,6 @@ with tab_read:
                             "3. 保持客观中立。"
                         )
 
-                    # --- 核心优化 C：调用 DeepSeek (流式) ---
                     with st.expander("📚 查看 AI 参考的原文片段 (Sources)", expanded=False):
                         st.markdown("\n\n".join(refs))
 
@@ -1262,14 +1258,114 @@ with tab_read:
                 st.session_state.pending_note = None
                 st.toast("笔记保存成功！", icon="🎉")
                 st.rerun()
+# ══════════════════════════════════════════
+# Tab 3：关键词追踪
+# ══════════════════════════════════════════
+with tab_track:
+    st.subheader("🔔 关键词追踪")
+    st.caption("添加关键词后，App 每次启动自动检查 arXiv，有新论文时 Tab 标题显示数量提醒。")
+
+    add1,add2,add3 = st.columns([3,1.2,1])
+    with add1:
+        new_kw = st.text_input("关键词", placeholder="例如: diffusion model",
+                               label_visibility="collapsed", key="tracker_new_kw")
+    with add2:
+        ih = st.selectbox("检查间隔",[6,12,24,72],
+                          format_func=lambda x:f"每 {x}h",
+                          label_visibility="collapsed", key="tracker_interval")
+    with add3:
+        if st.button("➕ 添加追踪", use_container_width=True) and new_kw.strip():
+            kw = new_kw.strip()
+            if kw not in st.session_state.trackers:
+                st.session_state.trackers[kw] = {
+                    "check_interval_h": ih, "last_checked": None,
+                    "seen_ids": [], "new_papers": [],
+                }
+                with st.spinner("首次检查中…"): tracker_run_all(force=True)
+                st.rerun()
+            else: st.warning("该关键词已在追踪列表中")
+
+    if st.session_state.trackers:
+        ga1,ga2 = st.columns([3,1])
+        with ga1:
+            nn = st.session_state.tracker_total_new
+            bdg = (f"<span class='tracker-new-badge'>🆕 {nn} 篇未读</span>" if nn > 0
+                   else "<span style='color:#94a3b8;font-size:.85em'>暂无未读</span>")
+            st.markdown(f"共追踪 **{len(st.session_state.trackers)}** 个关键词 · {bdg}", unsafe_allow_html=True)
+        with ga2:
+            if st.button("🔄 立即全部刷新", use_container_width=True):
+                with st.spinner("检查中…"): tracker_run_all(force=True)
+                st.rerun()
+
+    st.markdown("---")
+
+    if not st.session_state.trackers:
+        st.info("还没有追踪任何关键词，在上方添加第一个吧！")
+    else:
+        for kw, data in list(st.session_state.trackers.items()):
+            new_papers = data.get("new_papers",[])
+            last_chk   = data.get("last_checked","从未")
+            n_new      = len(new_papers)
+            badge      = (f"<span class='tracker-new-badge'>🆕 {n_new} 篇新论文</span>"
+                          if n_new > 0 else "<span style='color:#94a3b8;font-size:.8em'>暂无新论文</span>")
+
+            with st.container(border=True):
+                th1,th2,th3,th4 = st.columns([3,2,1,1])
+                with th1: st.markdown(f"**🔑 {kw}** {badge}", unsafe_allow_html=True)
+                with th2: st.caption(f"🕐 上次: {last_chk[:16] if last_chk != '从未' else '从未'}")
+                with th3:
+                    if st.button("✅ 标记已读", key=f"read_{kw}", use_container_width=True, disabled=(n_new==0)):
+                        tracker_mark_read(kw); st.rerun()
+                with th4:
+                    if st.button("🗑️ 删除", key=f"del_track_{kw}", use_container_width=True):
+                        del st.session_state.trackers[kw]
+                        st.session_state.tracker_total_new = sum(
+                            len(d.get("new_papers",[])) for d in st.session_state.trackers.values()
+                        ); st.rerun()
+
+            if new_papers:
+                for paper in new_papers:
+                    st.markdown(
+                        f"""
+                        <div class="new-paper-card">
+                            <div style="font-weight:700;color:#1e293b;font-size:.93em;
+                                        margin-bottom:6px;line-height:1.4;">
+                                📄 {paper['title']}
+                            </div>
+                            <div style="color:#64748b;font-size:.83em;margin-bottom:10px;">
+                                👤 {paper['authors']} &nbsp;·&nbsp; 📅 {paper['published']}
+                            </div>
+                            <div style="color:#475569;font-size:.85em;line-height:1.7;">
+                                {paper['summary']}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True,
+                    )
+                    pb1,pb2,pb3 = st.columns([1,1,4])
+                    with pb1: st.markdown(f"[🔗 ArXiv]({paper['entry_id']})")
+                    with pb2:
+                        if st.button("⬇️ 入库", key=f"tr_dl_{paper['entry_id']}"):
+                            with st.spinner("下载中…"):
+                                try:
+                                    pdf_path = download_arxiv_pdf_direct(paper['entry_id'])
+                                    process_and_add_to_topic(pdf_path, paper['title'], user_api_key)
+                                    st.success("已入库！")
+                                except Exception as e: st.error(str(e))
+                    with pb3:
+                        if st.button("🕸️ 查图谱", key=f"tr_graph_{paper['entry_id']}"):
+                            st.session_state.focus_paper_id = paper['entry_id']; st.rerun()
+            else:
+                st.caption(f"暂无新论文 · 检查间隔：每 {data.get('check_interval_h',12)}h")
+
+            st.markdown("")
 
 # ══════════════════════════════════════════
-# Tab 3：我的笔记
+# Tab 4：我的笔记
 # ══════════════════════════════════════════
 with tab_notes:
     st.subheader("📌 我的笔记库")
     if not st.session_state.notes:
-        st.info("还没有笔记。在「研读空间」提问后点击「保存为笔记」即可积累。")
+        st.info("还没有笔记。在「研读空间」提问后点击「保存没笔记」即可积累。")
     else:
         all_tags   = sorted(set(tag for n in st.session_state.notes for tag in n["tags"]))
         all_topics = sorted(set(n["topic"] for n in st.session_state.notes))
@@ -1298,7 +1394,7 @@ with tab_notes:
                     st.rerun()
             if note.get("question"):
                 st.markdown(f"**❓ {note['question']}**")
-            st.markdown(note["content"])   # 完整内容，不截断
+            st.markdown(note["content"])
 
         st.markdown("---")
         if st.button("🗑️ 清空所有笔记", type="secondary"):
