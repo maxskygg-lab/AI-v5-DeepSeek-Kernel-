@@ -121,8 +121,8 @@ defaults = {
     "contributions_cache":    {},
     "score_cache":            {}, # --- 修改点：新增打分缓存 ---
     "chat_history":           [],
-    "topics":                 {"默认主题": {"files": [], "chunks": [], "db": None}},
-    "active_topic":           "默认主题",
+    "topics":                 {"default_topic": {"files": [], "chunks": [], "db": None}},
+    "active_topic":           "default_topic",
     "selected_scope":         "🌐 对比所有论文",
     "notes":                  [],
     "pending_note":           None,
