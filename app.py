@@ -593,7 +593,8 @@ with st.sidebar:
             # --- 修改点：连带清空 Pinecone 该主题的 namespace ---
             if ts["db"]:
                 try:
-                    ts["db"].delete(delete_all=True, namespace=st.session_state.active_topic)
+                    safe_namespace = st.session_state.active_topic.encode('utf-8').hex() # <--- 【新增修改点 5：清空动作也要将主题名转译，对齐创建时的名称】
+                    ts["db"].delete(delete_all=True, namespace=safe_namespace) # <--- 【新增修改点 6：传入安全的名称执行清空】
                 except Exception: pass
             ts["files"],ts["chunks"],ts["db"] = [],[],None
             st.session_state.chat_history = []; st.rerun()
