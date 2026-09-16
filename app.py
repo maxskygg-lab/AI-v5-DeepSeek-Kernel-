@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import os, time, tempfile, re, math, uuid, itertools, io
+import os, time, tempfile, re, math, uuid, itertools, io, hashlib
 import arxiv, requests
 import numpy as np # <--- 【修改点 1：新增 numpy 库，用于在内存中进行高效的向量矩阵余弦相似度计算】
 from datetime import datetime, timedelta
@@ -167,6 +167,9 @@ def active_topic_data():
 def get_pure_arxiv_id(url_or_id):
     m = re.search(r'(\d{4}\.\d{4,5})', url_or_id)
     return m.group(1) if m else url_or_id.split('/')[-1].split('v')[0]
+
+def get_pinecone_namespace(name):
+    return "ns_" + hashlib.md5(str(name).encode('utf-8')).hexdigest()
 
 def convert_to_excel(results):
     data = []
@@ -434,7 +437,7 @@ def process_and_add_to_topic(file_path, file_name, api_key, topic_name=None):
         
         if t["db"] is None:
             # 初始化连接云端索引，按主题划分 namespace
-            t["db"] = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings, namespace=topic_name)
+            t["db"] = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings, namespace=get_pinecone_namespace(topic_name))
             
         # 直接向 Pinecone 批量添加文档向量
         for i in range(0, len(chunks), batch):
@@ -460,7 +463,7 @@ def rebuild_topic_index(topic_name, api_key):
     import os
     if PINECONE_API_KEY:
         os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
-    t["db"] = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings, namespace=topic_name)
+    t["db"] = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings, namespace=get_pinecone_namespace(topic_name))
 
 def detect_knowledge_gap(answer_text, docs):
     sigs = ["资料不足","没有找到","无法回答","未提及","不清楚","没有相关","cannot find","not mentioned"]
@@ -592,7 +595,7 @@ with st.sidebar:
             # --- 修改点：连带清空 Pinecone 该主题的 namespace ---
             if ts["db"]:
                 try:
-                    ts["db"].delete(delete_all=True, namespace=st.session_state.active_topic)
+                    ts["db"].delete(delete_all=True, namespace=get_pinecone_namespace(st.session_state.active_topic))
                 except Exception: pass
             ts["files"],ts["chunks"],ts["db"] = [],[],None
             st.session_state.chat_history = []; st.rerun()
