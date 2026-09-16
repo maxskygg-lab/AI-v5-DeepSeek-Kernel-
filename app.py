@@ -135,10 +135,6 @@ for k, v in defaults.items():
 
 # ================= 4. 工具函数 =================
 
-# --- 新增修改点：将包含中文的主题名安全转换为 Pinecone 要求的纯 ASCII Namespace ---
-def get_safe_namespace(name):
-    return "ns_" + name.encode('utf-8').hex()
-
 # --- 新增：直接下载 ArXiv PDF，提高效率 ---
 def download_arxiv_pdf_direct(arxiv_id):
     clean_id = get_pure_arxiv_id(arxiv_id)
@@ -156,7 +152,7 @@ def get_deepseek_llm(api_key, temperature=0.1):
     return ChatOpenAI(
         model="deepseek-chat",
         openai_api_key=api_key,
-        openai_api_base="https://api.deepseek.com/v1",
+        openai_api_base="https://api.deepseek.com",
         temperature=temperature
     )
 
@@ -372,8 +368,7 @@ def get_paper_score(arxiv_id, title, abstract, api_key, ss_key):
             r = requests.get(url, headers=headers, timeout=5)
             if r.status_code == 200:
                 data = r.json()
-                tldr_data = data.get("tldr")
-                tldr = tldr_data.get("text", "无") if isinstance(tldr_data, dict) else "无"
+                tldr = data.get("tldr", {}).get("text", "无") if data.get("tldr") else "无"
                 inf_cites = data.get("influentialCitationCount", 0)
                 pub_year = data.get("year", "未知年份")
                 ss_info = f"\n\n【Semantic Scholar 真实辅助数据】\n- 发表年份: {pub_year}\n- 极具影响力引用数: {inf_cites}\n- 官方TLDR摘要: {tldr}"
@@ -399,7 +394,7 @@ def get_paper_score(arxiv_id, title, abstract, api_key, ss_key):
             f"   - 综合发表年份、引用量（如有）以及研究方向的前沿热门程度给分。高引或极具潜力的热门方向给 22-30分；常规方向或普通跟进型研究给 15-21分；冷门且低引给0-14分。\n\n"
             f"【最终定档与输出规范】：\n"
             f"禁止输出计算过程、禁止输出拆项得分。只允许输出一行字：\n"
-            f"【xx分】点评：一句话犀利指出核心优缺点（需一针见血，不超过30个汉字）。\n\n"
+            f"【xx分】导师点评：一句话犀利指出核心优缺点（需一针见血，不超过30个汉字）。\n\n"
             f"标题：{title}\n摘要：{abstract[:600]}{ss_info}"
         )
         res = llm.invoke(prompt)
@@ -438,8 +433,8 @@ def process_and_add_to_topic(file_path, file_name, api_key, topic_name=None):
         os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
         
         if t["db"] is None:
-            # --- 新增修改点：使用 get_safe_namespace(topic_name) 避免中文 namespace 触发 400 错误 ---
-            t["db"] = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings, namespace=get_safe_namespace(topic_name))
+            # 初始化连接云端索引，按主题划分 namespace
+            t["db"] = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings, namespace=topic_name)
             
         # 直接向 Pinecone 批量添加文档向量
         for i in range(0, len(chunks), batch):
@@ -465,8 +460,7 @@ def rebuild_topic_index(topic_name, api_key):
     import os
     if PINECONE_API_KEY:
         os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
-    # --- 新增修改点：使用 get_safe_namespace(topic_name) 转换为纯 ASCII 命名空间 ---
-    t["db"] = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings, namespace=get_safe_namespace(topic_name))
+    t["db"] = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings, namespace=topic_name)
 
 def detect_knowledge_gap(answer_text, docs):
     sigs = ["资料不足","没有找到","无法回答","未提及","不清楚","没有相关","cannot find","not mentioned"]
@@ -595,10 +589,10 @@ with st.sidebar:
                         except Exception: pass
                     rebuild_topic_index(st.session_state.active_topic, user_api_key); st.rerun()
         if st.button("🗑️ 清空主题", type="primary"):
-            # --- 修改点：连带清空 Pinecone 该主题的 namespace（已增加 get_safe_namespace 转换） ---
+            # --- 修改点：连带清空 Pinecone 该主题的 namespace ---
             if ts["db"]:
                 try:
-                    ts["db"].delete(delete_all=True, namespace=get_safe_namespace(st.session_state.active_topic))
+                    ts["db"].delete(delete_all=True, namespace=st.session_state.active_topic)
                 except Exception: pass
             ts["files"],ts["chunks"],ts["db"] = [],[],None
             st.session_state.chat_history = []; st.rerun()
@@ -688,52 +682,26 @@ with tab_main:
                     val = journal_query.strip()
                     refined += f' AND (jr:"{val}" OR co:"{val}")'
                 
-                # --- 终极安全检索逻辑：防崩溃、逐条获取、精准拦截 503 ---
-                search = arxiv.Search(query=refined, max_results=30, sort_by=asort)
-                
-                # 1. 初始化客户端：强制将底层请求 URL 的批次量 (page_size) 从默认的 100 降为 15
-                client = arxiv.Client(
-                    page_size=15,         # 关键修改：直接控制发送给服务器的单次索要数量
-                    delay_seconds=4.0,    # 满足 ArXiv 要求的强制冷却时间
-                    num_retries=3
-                )
-                
-                # 2. 搜索条件：限制最终需要的总数不超过 30
-                search = arxiv.Search(
-                    query=refined, 
-                    max_results=30, 
-                    sort_by=asort
-                )
-                
+                # --- 新增辅助提示：在界面上显示真实发送给接口的查询语句 ---
+                st.caption(f"🔍 检索指令预览: `{refined}`")
+
+                # --- 429 防崩溃重试机制 ---
+                max_retries = 3
+                raw = []
                 for attempt in range(max_retries):
                     try:
-                        time.sleep(2) # 每次真正发起请求前，强制主线程休眠 2 秒缓冲
-                        
-                        # 建立生成器（此时还未发起真实网络请求）
-                        raw_gen = client.results(search)
+                        # --- 修改点：增加 max_results=2000，让 ArXiv 把底库翻个底朝天 ---
+                        raw_gen = arxiv.Client().results(arxiv.Search(query=refined, max_results=2000, sort_by=asort))
                         st.session_state.search_generator = raw_gen
-                        
-                        # 2. 核心修改：弃用容易一次性崩盘的 itertools.islice，改为安全的逐条迭代
-                        raw = []
-                        for paper in raw_gen:
-                            raw.append(paper)
-                            if len(raw) >= 30: # 凑够 30 条立刻手动刹车
-                                break
-                                
-                        break # 如果成功走完这一步，说明没报错，直接跳出重试循环
-                        
+                        # --- 修改点：初次加载数量从 50 提升到 100，避免单次太多导致 API 崩溃 ---
+                        raw = list(itertools.islice(raw_gen, 100))
+                        break 
                     except Exception as e:
-                        err_str = str(e)
-                        # 3. 如果是被官方限流或服务器宕机，且还有重试机会
-                        if ("503" in err_str or "429" in err_str) and attempt < max_retries - 1:
-                            time.sleep(4 + attempt * 4) # 依次退避等待 4秒, 8秒, 12秒
+                        if "429" in str(e) and attempt < max_retries - 1:
+                            time.sleep(3)
                             continue
-                        else:
-                            # 4. 达到最大重试次数仍失败，拦截崩溃并给出保底提示
-                            st.error(f"🚨 ArXiv 官方服务器暂时拒绝了连接请求。")
-                            st.warning(f"**诊断信息**: {err_str}\n\n**原因分析**: 您当前应用部署在 Streamlit Cloud 上，其共享的公网 IP 极易被 ArXiv 官方防爬虫系统临时封禁（HTTP 503）。\n\n**建议方案**:\n- 请稍等 10-30 分钟后再试。\n- 若需长期稳定运行，建议将代码拉取到本地电脑运行，或将底层的检索数据源彻底迁移为 Semantic Scholar。")
-                            break # 终止循环，防止整个网页死机
-
+                        else: raise e
+                
                 # --- 新增辅助提示：针对零结果给出清晰引导 ---
                 if not raw:
                     st.warning("⚠️ 未找到匹配论文。建议：1. 缩减关键词 2. 清空‘期刊名称’筛选框 3. 检查学科分类是否选错。")
@@ -967,10 +935,7 @@ with tab_main:
                             # 文件名加上原始排名序号，方便对应
                             filename = f"{dl_start + idx}_{safe_title}.pdf"
                             zf.write(p_path, arcname=filename)
-                            try:
-                                os.remove(p_path) 
-                            except Exception:
-                                pass
+                            os.remove(p_path) 
                         except Exception as e:
                             pass 
                         # 每次循环更新进度，维持前端存活
