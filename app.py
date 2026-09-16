@@ -359,8 +359,7 @@ def get_paper_score(arxiv_id, title, abstract, api_key, ss_key):
     # 此处已移除对 st.session_state 的直接读写，变为纯函数，防止多线程崩溃
     try:
         clean_id = get_pure_arxiv_id(arxiv_id)
-        # --- 核心打分标尺修改点 1：向 Semantic Scholar 请求增加 'year' 字段 ---
-        url = f"https://api.semanticscholar.org/graph/v1/paper/ArXiv:{clean_id}?fields=tldr,influentialCitationCount,year"
+        url = f"https://api.semanticscholar.org/graph/v1/paper/ArXiv:{clean_id}?fields=tldr,influentialCitationCount"
         headers = {"x-api-key": ss_key} if ss_key else {}
         ss_info = ""
         try:
@@ -369,34 +368,16 @@ def get_paper_score(arxiv_id, title, abstract, api_key, ss_key):
                 data = r.json()
                 tldr = data.get("tldr", {}).get("text", "无") if data.get("tldr") else "无"
                 inf_cites = data.get("influentialCitationCount", 0)
-                pub_year = data.get("year", "未知")
-                ss_info = f"\n\nSemantic Scholar真实数据：\n- 发表年份: {pub_year}\n- 极具影响力引用数: {inf_cites}\n- TLDR极简摘要: {tldr}"
+                ss_info = f"\n\nSemantic Scholar真实数据：\n- 极具影响力引用数: {inf_cites}\n- TLDR极简摘要: {tldr}"
         except: pass
 
-        # --- 核心打分标尺修改点 2：将温度值强制设为 0.0 锁死随机性 ---
-        llm = get_deepseek_llm(api_key, temperature=0.0)
-        
-        # --- 核心打分标尺修改点 3：部署硬性计算公式 Prompt ---
+        llm = get_deepseek_llm(api_key, temperature=0.1)
         prompt = (
-            f"你是一个冷酷、严谨的学术打分机器。请严格按照以下【量化评分标准】对论文进行打分（满分100分）。\n"
-            f"为了保证每次打分绝对一致，请你严格依据文本执行加减分，禁止任何主观臆测：\n\n"
-            f"【量化评分标准（总分100）】：\n"
-            f"1. 基础客观影响力（40分）：\n"
-            f"   - 若无年份数据或极具影响力引用数（视为0处理）。\n"
-            f"   - 若发表年份在 2024、2025、2026年（最新论文）：默认给35分基础分（容忍低引用），极具影响力引用每多1个加1分，最高上限40分。\n"
-            f"   - 若发表年份在 2023年及以前：极具影响力引用数 ≥ 50 给40分；≥ 10 给30分；≥ 1 给20分；0引用 给10分。\n"
-            f"2. 问题价值与创新性（30分）：\n"
-            f"   - 摘要或TLDR中明确使用了诸如'novel', 'first', 'new', 'introduce'等词汇提出全新视角的：得30分。\n"
-            f"   - 提出了已有方法的改进（'improve', 'better', 'extend'等）或新应用场景的：得20分。\n"
-            f"   - 常规研究、仅做综述或缺乏明确创新点的：得10分。\n"
-            f"3. 方案与结果的详实度（30分）：\n"
-            f"   - 摘要中同时包含【明确的模型/方法】+【具体的量化数据指标（如提升了xx%、达到了xx准确率）】：得30分。\n"
-            f"   - 仅提到方法但缺乏具体结果量化数据的：得20分。\n"
-            f"   - 描述笼统，完全缺乏具体技术细节的：得10分。\n\n"
-            f"【输出要求】：\n"
-            f"必须严格按照以下格式输出，禁止输出你的计算过程或其他多余的废话：\n"
-            f"【xx分】一句话理由（需指出该分数维度的核心原因，不超过30个字）。\n\n"
-            f"【论文信息】：\n"
+            f"请根据这篇论文的信息对其进行综合打分（满分100分）。\n"
+            f"【评分优化标准】：\n"
+            f"1. 如果是经典老论文，请重点看重其真实影响力指标（引用量），不要因为年份久远扣分。\n"
+            f"2. 如果是最新论文（引用量往往为0），这是正常的，请重点评估其摘要体现的创新性和解决的痛点，切勿因为0引用而打低分。\n"
+            f"请严格按照此格式输出：【xx分】一句话理由（不超过30字）。\n\n"
             f"标题：{title}\n摘要：{abstract[:600]}{ss_info}"
         )
         res = llm.invoke(prompt)
@@ -900,6 +881,7 @@ with tab_main:
             unsafe_allow_html=True
         )
 
+        # --- 修改点开始：将下载和打分按钮重构为三列，加入动态数量输入，并新增打包下载 PDF 功能 ---
         col_excel, col_score, col_pdf = st.columns(3)
         
         with col_excel:
@@ -935,42 +917,47 @@ with tab_main:
                 st.rerun()
                 
         with col_pdf:
-            st.write("📦 **下载原文范围 (篇)**")
-            c_dl_1, c_dl_2 = st.columns(2)
-            with c_dl_1:
-                dl_start = st.number_input("从第", min_value=1, max_value=max(1, len(st.session_state.search_results)), value=1, step=1, key="batch_dl_start")
-            with c_dl_2:
-                dl_end = st.number_input("到第", min_value=dl_start, max_value=max(dl_start, len(st.session_state.search_results)), value=max(dl_start, min(dl_start + 9, len(st.session_state.search_results))), step=1, key="batch_dl_end")
-            
-            if st.button(f"🔄 打包 ZIP ({dl_start}-{dl_end} 篇)", use_container_width=True):
+            dl_num = st.number_input("📦 **下载原文数量 (篇)**", min_value=1, max_value=max(1, len(st.session_state.search_results)), value=min(10, len(st.session_state.search_results)), step=1, key="batch_dl_n")
+            if st.button(f"🔄 打包 ZIP (前 {dl_num} 篇)", use_container_width=True):
+                # ==========================
+                # --- 新修改点：重构打包逻辑，开启真实硬盘流式传输，彻底防止内存崩溃 ---
+                # ==========================
                 import zipfile
+                # 使用硬盘临时文件替代内存缓冲
                 temp_zip_path = os.path.join(tempfile.gettempdir(), f"arxiv_batch_{uuid.uuid4().hex[:8]}.zip")
-                to_dl = st.session_state.search_results[dl_start-1 : dl_end]
-                dl_total = len(to_dl)
+                to_dl = st.session_state.search_results[:dl_num]
                 
+                # 使用状态文本与进度条，保证网页实时与后台通讯
                 status_text = st.empty()
                 progress_bar = st.progress(0)
                 
                 with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for idx, item in enumerate(to_dl):
                         res = item['obj']
-                        status_text.text(f"📥 正在提取并压缩 ({idx+1}/{dl_total}): {res.title[:25]}...")
+                        status_text.text(f"📥 正在提取并压缩 ({idx+1}/{dl_num}): {res.title[:25]}...")
                         try:
+                            # 增加 1.5 秒安全休眠，防高并发触发 ArXiv 的防 DDoS 封锁
                             time.sleep(1.5)
                             p_path = download_arxiv_pdf_direct(res.entry_id)
                             safe_title = re.sub(r'[\\/*?:"<>|]', "", res.title)[:50]
-                            filename = f"{dl_start + idx}_{safe_title}.pdf"
+                            filename = f"{idx+1}_{safe_title}.pdf"
                             zf.write(p_path, arcname=filename)
                             os.remove(p_path) 
                         except Exception as e:
                             pass 
-                        progress_bar.progress((idx + 1) / dl_total)
+                        # 每次循环更新进度，维持前端存活
+                        progress_bar.progress((idx + 1) / dl_num)
                 
                 status_text.text("✅ 打包完成！正在生成最终下载链接...")
                 
+                # 保留文件路径，而不是将几百兆数据塞进内存变量
                 st.session_state.ready_zip_path = temp_zip_path
-                st.session_state.ready_zip_name = f"ArXiv_PDFs_{dl_start}to{dl_end}_{datetime.now().strftime('%m%d_%H%M')}.zip"
+                st.session_state.ready_zip_name = f"ArXiv_PDFs_Top{dl_num}_{datetime.now().strftime('%m%d_%H%M')}.zip"
+                # ==========================
+                # --- 新修改点结束 ---
+                # ==========================
             
+            # 如果缓存里有打包好的文件路径，打开文件流供按钮下载，零内存占用！
             if st.session_state.get("ready_zip_path") and os.path.exists(st.session_state.get("ready_zip_path")):
                 with open(st.session_state.ready_zip_path, "rb") as f:
                     st.download_button(
@@ -981,6 +968,7 @@ with tab_main:
                         use_container_width=True,
                         type="primary"
                     )
+        # --- 修改点结束 ---
         
         st.markdown("---")
         
@@ -1036,8 +1024,10 @@ with tab_main:
         
     if st.session_state.search_generator:
         st.markdown("---")
+        # --- 修改点：按钮文案同步修改为 100 篇 ---
         if st.button("🔽 加载更多 100 篇...", use_container_width=True):
             with st.spinner("正在拉取新论文摘要..."):
+                # --- 修改点：每次额外拉取数量提升到 100 ---
                 more_raw = list(itertools.islice(st.session_state.search_generator, 100))
                 if more_raw:
                     new_results = [{"obj": r, "citations": None} for r in more_raw]
@@ -1100,10 +1090,13 @@ with tab_main:
 # Tab 2：研读空间
 # ══════════════════════════════════════════
 with tab_read:
+    # --- 1. 顶部控制栏：精准控制 Scope ---
     t = active_topic_data()
     
+    # 布局：左侧选模式，右侧状态显示
     c_ctrl, c_info = st.columns([2, 3])
     with c_ctrl:
+        # 核心修改：明确的范围选择，不再默认全库检索
         scope_options = ["🌐 全库综合 (对比/综述)"] + t["files"]
         selected_scope = st.selectbox(
             "📚 阅读范围 (Scope)", 
@@ -1112,6 +1105,7 @@ with tab_read:
             help="选择“全库”进行跨论文对比；选择“单篇”将只检索该论文内容，更省 Token 且更精准。"
         )
     with c_info:
+        # 显示当前 Token 使用情况预估或入库状态
         if selected_scope == "🌐 全库综合 (对比/综述)":
             st.caption(f"🚀 当前模式：检索所有 {len(t['files'])} 篇论文")
         else:
@@ -1119,7 +1113,9 @@ with tab_read:
 
     st.divider()
 
+    # --- 2. 聊天历史回显 (原生组件) ---
     if not st.session_state.chat_history:
+        # 欢迎引导语
         with st.chat_message("assistant"):
             st.markdown(f"👋 我是你的 DeepSeek 研读助手。当前主题库中有 **{len(t['files'])}** 篇论文。")
             if t["files"]:
@@ -1129,23 +1125,30 @@ with tab_read:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
+    # --- 3. 聊天输入与处理 ---
     if prompt := st.chat_input("输入问题..."):
+        # 0. 检查是否有库
         if not t["db"]:
             st.error("请先在左侧上传 PDF 或从检索页下载论文入库！")
             st.stop()
 
+        # 1. 用户消息上屏
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
+        # 2. AI 生成回答
         with st.chat_message("assistant"):
+            # 占位符用于流式输出
             message_placeholder = st.empty()
             full_response = ""
             
             try:
+                # --- 核心优化 A：精准检索策略 ---
                 search_kwargs = {}
                 filter_rule = None
                 
+                # 如果选择了特定论文，构建 metadata 过滤器
                 if selected_scope != "🌐 全库综合 (对比/综述)":
                     filter_rule = {"source_paper": selected_scope}
                     search_kwargs = {"k": 20, "filter": filter_rule}
@@ -1155,17 +1158,21 @@ with tab_read:
                     status_text = f"🔍 正在全库 {len(t['files'])} 篇论文中检索..."
 
                 with st.spinner(status_text):
+                    # 执行检索
                     if filter_rule:
                         docs = t["db"].similarity_search(prompt, **search_kwargs)
+                        # --- 修改点：单篇模式下，额外获取 SS 真实元数据以增强问答 ---
                         ss_data = fetch_ss_paper_details_by_title(selected_scope, ss_api_key)
                     else:
                         docs = t["db"].max_marginal_relevance_search(prompt, **search_kwargs)
                         ss_data = None
 
+                # --- 核心优化 B：构建更智能的 Prompt ---
                 if not docs:
                     full_response = "⚠️ 未在文档中检索到相关信息，请尝试更换关键词或检查文档是否完整。"
                     message_placeholder.markdown(full_response)
                 else:
+                    # 整理上下文，带上来源标记
                     context_text = ""
                     refs = []
                     for i, d in enumerate(docs):
@@ -1175,6 +1182,7 @@ with tab_read:
                         context_text += f"[资料{i+1} | {src} (P{page})]: {snippet}\n\n"
                         refs.append(f"**[{i+1}] {src} (P{page})**: {snippet[:100]}...")
                         
+                    # --- 修改点：如果获取到了 SS 真实数据，注入给 LLM ---
                     ss_context = ""
                     if ss_data:
                         tldr = ss_data.get('tldr', {}).get('text', '无') if ss_data.get('tldr') else '无'
@@ -1189,6 +1197,7 @@ with tab_read:
                             f"**指令**：你在回答背景、影响力和核心结论时，必须优先以这部分的真实元数据为准，不要编造不存在的事实。\n"
                         )
 
+                    # 动态 System Prompt
                     if selected_scope != "🌐 全库综合 (对比/综述)":
                         sys_prompt = (
                             f"你正在辅助用户精读论文《{selected_scope}》。\n"
@@ -1208,6 +1217,7 @@ with tab_read:
                             "3. 保持客观中立。"
                         )
 
+                    # --- 核心优化 C：调用 DeepSeek (流式) ---
                     with st.expander("📚 查看 AI 参考的原文片段 (Sources)", expanded=False):
                         st.markdown("\n\n".join(refs))
 
@@ -1325,6 +1335,7 @@ with tab_track:
 
             if new_papers:
                 for paper in new_papers:
+                    # 完整标题、完整作者、完整摘要，不截断
                     st.markdown(
                         f"""
                         <div class="new-paper-card">
@@ -1347,6 +1358,7 @@ with tab_track:
                         if st.button("⬇️ 入库", key=f"tr_dl_{paper['entry_id']}"):
                             with st.spinner("下载中…"):
                                 try:
+                                    # --- 修改点：使用统一的高效直链下载函数 ---
                                     pdf_path = download_arxiv_pdf_direct(paper['entry_id'])
                                     process_and_add_to_topic(pdf_path, paper['title'], user_api_key)
                                     st.success("已入库！")
@@ -1365,7 +1377,7 @@ with tab_track:
 with tab_notes:
     st.subheader("📌 我的笔记库")
     if not st.session_state.notes:
-        st.info("还没有笔记。在「研读空间」提问后点击「保存没笔记」即可积累。")
+        st.info("还没有笔记。在「研读空间」提问后点击「保存为笔记」即可积累。")
     else:
         all_tags   = sorted(set(tag for n in st.session_state.notes for tag in n["tags"]))
         all_topics = sorted(set(n["topic"] for n in st.session_state.notes))
@@ -1394,7 +1406,7 @@ with tab_notes:
                     st.rerun()
             if note.get("question"):
                 st.markdown(f"**❓ {note['question']}**")
-            st.markdown(note["content"])
+            st.markdown(note["content"])   # 完整内容，不截断
 
         st.markdown("---")
         if st.button("🗑️ 清空所有笔记", type="secondary"):
