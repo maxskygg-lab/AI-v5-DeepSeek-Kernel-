@@ -15,8 +15,11 @@ try:
     from langchain_community.embeddings import HuggingFaceEmbeddings
     # --- 修改点：引入 Pinecone 云端向量数据库 ---
     from langchain_pinecone import PineconeVectorStore
+    # --- 【混合检索修改点：新增 BM25 和 CrossEncoder 依赖】 ---
+    import rank_bm25
+    import sentence_transformers
 except ImportError as e:
-    st.error(f"🚑 环境缺失库 -> {e.name}. 请运行: pip install langchain-openai sentence-transformers pymupdf langchain-pinecone pinecone-client")
+    st.error(f"🚑 环境缺失库 -> {e.name}. 请运行: pip install langchain-openai sentence-transformers pymupdf langchain-pinecone pinecone-client rank_bm25")
     st.stop()
 
 from langchain_community.document_loaders import PyPDFLoader
@@ -355,60 +358,53 @@ def get_one_line_contribution(abstract, title, api_key):
     st.session_state.contributions_cache[key] = result
     return result
 
-# --- 修改点：新增依据 SS 真实数据的单篇论文打分函数（含指数退避抗抖动重试机制） ---
+# --- 修改点：新增依据 SS 真实数据的单篇论文打分函数 ---
 def get_paper_score(arxiv_id, title, abstract, api_key, ss_key):
     # 此处已移除对 st.session_state 的直接读写，变为纯函数，防止多线程崩溃
-    max_retries = 3
-    for attempt in range(max_retries):
+    try:
+        clean_id = get_pure_arxiv_id(arxiv_id)
+        # 向 Semantic Scholar 请求时增加了 year 字段，获取真实发表年份
+        url = f"https://api.semanticscholar.org/graph/v1/paper/ArXiv:{clean_id}?fields=tldr,influentialCitationCount,year"
+        headers = {"x-api-key": ss_key} if ss_key else {}
+        ss_info = ""
         try:
-            clean_id = get_pure_arxiv_id(arxiv_id)
-            # 向 Semantic Scholar 请求时增加了 year 字段，获取真实发表年份
-            url = f"https://api.semanticscholar.org/graph/v1/paper/ArXiv:{clean_id}?fields=tldr,influentialCitationCount,year"
-            headers = {"x-api-key": ss_key} if ss_key else {}
-            ss_info = ""
-            try:
-                r = requests.get(url, headers=headers, timeout=5)
-                if r.status_code == 200:
-                    data = r.json()
-                    tldr = data.get("tldr", {}).get("text", "无") if data.get("tldr") else "无"
-                    inf_cites = data.get("influentialCitationCount", 0)
-                    pub_year = data.get("year", "未知年份")
-                    ss_info = f"\n\n【Semantic Scholar 真实辅助数据】\n- 发表年份: {pub_year}\n- 极具影响力引用数: {inf_cites}\n- 官方TLDR摘要: {tldr}"
-            except: pass
+            r = requests.get(url, headers=headers, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                tldr = data.get("tldr", {}).get("text", "无") if data.get("tldr") else "无"
+                inf_cites = data.get("influentialCitationCount", 0)
+                pub_year = data.get("year", "未知年份")
+                ss_info = f"\n\n【Semantic Scholar 真实辅助数据】\n- 发表年份: {pub_year}\n- 极具影响力引用数: {inf_cites}\n- 官方TLDR摘要: {tldr}"
+        except: pass
 
-            # 锁定 temperature 为 0.0，杜绝大模型随机性，严格执行量表
-            llm = get_deepseek_llm(api_key, temperature=0.0)
-            # --- 修改点：优化打分 prompt，缓和极端低分，提高区分度以解决分数雷同问题 ---
-            prompt = (
-                f"你现在是一位顶尖人工智能领域的资深论文导师。请你结合给定信息，客观且富有区分度地对这篇论文进行综合打分（满分100分）。\n"
-                f"当前的打分常常偏低且雷同，请仔细发掘论文的细节和创新点，充分利用整个分数段（不要刻意压低分数），拉开合理的差距。\n\n"
-                f"【学术打分量表（满分100）】：\n"
-                f"1. 核心创新与突破性 (40分)：\n"
-                f"   - 35-40分：提出颠覆性架构或解决领域重大难题。\n"
-                f"   - 28-34分：有扎实的创新点，对SOTA有显著改进，或提供高价值数据集。\n"
-                f"   - 20-27分：常规的渐进式改进，逻辑自洽，具备一定的实用价值。\n"
-                f"   - 0-19分：创新性较弱，单纯的模块拼接或方法套用。\n"
-                f"2. 方法严谨度与可信度 (30分)：\n"
-                f"   - 25-30分：摘要明确列出量化指标、对比了强基线，提及开源或详尽实验验证。\n"
-                f"   - 18-24分：提到实验效果提升，有合理的数据支持，但描述偏向概括。\n"
-                f"   - 0-17分：缺乏具体数据指标支撑，结论偏主观或含糊。\n"
-                f"3. 学术影响力与时效潜力 (30分)：\n"
-                f"   - 综合发表年份、引用量（如有）以及研究方向的前沿热门程度给分。高引或极具潜力的热门方向给 22-30分；常规方向或普通跟进型研究给 15-21分；冷门且低引给0-14分。\n\n"
-                f"【最终定档与输出规范】：\n"
-                f"禁止输出计算过程、禁止输出拆项得分。只允许输出一行字：\n"
-                f"【xx分】点评：一句话犀利指出核心优缺点（需一针见血，不超过30个汉字）。\n\n"
-                f"标题：{title}\n摘要：{abstract[:600]}{ss_info}"
-            )
-            res = llm.invoke(prompt)
-            result = res.content.strip()
-            if result:
-                return result
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep((attempt + 1) * 1.5) # 指数退避等待后自动重试
-                continue
-            return "（打分失败，已达最大重试次数）"
-    return "（打分失败）"
+        # 锁定 temperature 为 0.0，杜绝大模型随机性，严格执行量表
+        llm = get_deepseek_llm(api_key, temperature=0.0)
+        # --- 修改点：优化打分 prompt，缓和极端低分，提高区分度以解决分数雷同问题 ---
+        prompt = (
+            f"你现在是一位顶尖人工智能领域的资深论文导师。请你结合给定信息，客观且富有区分度地对这篇论文进行综合打分（满分100分）。\n"
+            f"当前的打分常常偏低且雷同，请仔细发掘论文的细节和创新点，充分利用整个分数段（不要刻意压低分数），拉开合理的差距。\n\n"
+            f"【学术打分量表（满分100）】：\n"
+            f"1. 核心创新与突破性 (40分)：\n"
+            f"   - 35-40分：提出颠覆性架构或解决领域重大难题。\n"
+            f"   - 28-34分：有扎实的创新点，对SOTA有显著改进，或提供高价值数据集。\n"
+            f"   - 20-27分：常规的渐进式改进，逻辑自洽，具备一定的实用价值。\n"
+            f"   - 0-19分：创新性较弱，单纯的模块拼接或方法套用。\n"
+            f"2. 方法严谨度与可信度 (30分)：\n"
+            f"   - 25-30分：摘要明确列出量化指标、对比了强基线，提及开源或详尽实验验证。\n"
+            f"   - 18-24分：提到实验效果提升，有合理的数据支持，但描述偏向概括。\n"
+            f"   - 0-17分：缺乏具体数据指标支撑，结论偏主观或含糊。\n"
+            f"3. 学术影响力与时效潜力 (30分)：\n"
+            f"   - 综合发表年份、引用量（如有）以及研究方向的前沿热门程度给分。高引或极具潜力的热门方向给 22-30分；常规方向或普通跟进型研究给 15-21分；冷门且低引给0-14分。\n\n"
+            f"【最终定档与输出规范】：\n"
+            f"禁止输出计算过程、禁止输出拆项得分。只允许输出一行字：\n"
+            f"【xx分】点评：一句话犀利指出核心优缺点（需一针见血，不超过30个汉字）。\n\n"
+            f"标题：{title}\n摘要：{abstract[:600]}{ss_info}"
+        )
+        res = llm.invoke(prompt)
+        result = res.content.strip()
+    except Exception as e:
+        result = "（打分失败）"
+    return result
 
 def fix_latex(text):
     if not text: return text
@@ -759,13 +755,11 @@ with tab_main:
                     import math
                     current_year = datetime.now().year
                     for idx, item in enumerate(st.session_state.search_results):
-                        # <--- 【修改点 5：优化平滑融合算法，防止高引用与时效分挤压，并应用真实语义向量分】 --->
+                        # <--- 【修改点 5：废弃伪相关性硬编码（if idx < 10 等），直接读取真实向量匹配分】 --->
                         rel_score = item.get('sim_score', 50.0)
                         
                         cites = item["citations"] or 0
-                        # 使用 log10 映射引用数，防止超高引用论文彻底碾压新论文
-                        cite_score = (math.log10(cites + 1) / 3.5) * 100
-                        cite_score = min(100.0, cite_score)
+                        cite_score = (math.log10(cites + 1) / 3.0) * 100
                         
                         pub_year = item['obj'].published.year
                         age = max(0, current_year - pub_year)
@@ -773,15 +767,15 @@ with tab_main:
                         # 针对不同模式计算时效补偿
                         if "质量优先" in sort_mode:
                             time_bonus = 0
-                            if age == 0: time_bonus = 35
+                            if age == 0: time_bonus = 40
                             elif age == 1: time_bonus = 20
                             elif age == 2: time_bonus = 10
                         else:
-                            time_bonus = max(0, 25 - age * 8)
+                            time_bonus = max(0, 30 - age * 10)
                             
-                        quality_score = min(100.0, cite_score * 0.7 + time_bonus)
+                        quality_score = min(100.0, cite_score + time_bonus)
                         
-                        # 融合真实语义分与质量分，加入非线性加权
+                        # 融合真实语义分与质量分
                         item["total_score"] = (rel_score * rel_w) + (quality_score * qual_w)
                         
                     st.session_state.search_results.sort(key=lambda x: x.get("total_score", 0), reverse=True)
@@ -1070,21 +1064,20 @@ with tab_main:
                             rel_score = item.get('sim_score', 50.0)
                             
                             cites = item["citations"] or 0
-                            cite_score = (math.log10(cites + 1) / 3.5) * 100
-                            cite_score = min(100.0, cite_score)
+                            cite_score = (math.log10(cites + 1) / 3.0) * 100
                             
                             pub_year = item['obj'].published.year
                             age = max(0, current_year - pub_year)
                             
                             if "质量优先" in sort_mode:
                                 time_bonus = 0
-                                if age == 0: time_bonus = 35
+                                if age == 0: time_bonus = 40
                                 elif age == 1: time_bonus = 20
                                 elif age == 2: time_bonus = 10
                             else:
-                                time_bonus = max(0, 25 - age * 8)
+                                time_bonus = max(0, 30 - age * 10)
                                 
-                            quality_score = min(100.0, cite_score * 0.7 + time_bonus)
+                            quality_score = min(100.0, cite_score + time_bonus)
                             item["total_score"] = (rel_score * rel_w) + (quality_score * qual_w)
                             
                         st.session_state.search_results.sort(key=lambda x: x.get("total_score", 0), reverse=True)
@@ -1119,6 +1112,54 @@ with tab_read:
             st.caption(f"🎯 当前模式：**专注研读** (已屏蔽其他论文干扰)")
 
     st.divider()
+
+    # --- 【新增功能块：多文献对比矩阵与溯源综述生成】 ---
+    if selected_scope == "🌐 全库综合 (对比/综述)" and len(t["files"]) > 0:
+        with st.expander("📊 多文献结构化对比与综述生成 (Hybrid RAG 赋能)", expanded=False):
+            st.markdown("支持勾选多篇论文，系统将自动提取各项特征并渲染结构化矩阵，同时生成**带真实原文引证与段落脚标**的文献综述。")
+            matrix_papers = st.multiselect("📌 勾选需对比的文献（建议 2-5 篇，避免超量）", t["files"], default=t["files"][:3] if len(t["files"]) >= 2 else t["files"])
+            
+            if st.button("🚀 抽取文献生成矩阵与综述", use_container_width=True) and matrix_papers:
+                with st.spinner("🧠 正在提取文献片段，构建对比矩阵及追溯综述初稿（这可能需要一些时间，请耐心等待）..."):
+                    try:
+                        # 步骤 1：为防止 Token 爆炸，每篇论文取前 15 个代表性文档块（通常包含摘要与引言）
+                        refs_text = ""
+                        for p in matrix_papers:
+                            p_chunks = [c for c in t["chunks"] if c.metadata.get("source_paper") == p][:15]
+                            refs_text += f"\n\n【文献：{p}】\n"
+                            for idx, c in enumerate(p_chunks):
+                                page_num = c.metadata.get('page', 0) + 1
+                                refs_text += f"[P{page_num} | 段落{idx+1}] {c.page_content}\n"
+                        
+                        # 步骤 2：调用大模型进行信息整合与综述
+                        llm = get_deepseek_llm(USER_API_KEY, temperature=0.1)
+                        matrix_prompt = (
+                            "你是一位资深的AI顶会审稿人与学术研究员。请仔细阅读以下提供的多篇论文原文片段，完成以下两项任务：\n\n"
+                            "### 任务一：结构化对比矩阵 (Markdown Table)\n"
+                            "请严格提取各论文的核心特征，输出一个对比表格，**表头必须且只能包含以下五列：论文名称、创新点、基准数据集、SOTA 指标、局限性**。若某些论文在所给材料中未提及某一项，请填写“未明确提及”。\n\n"
+                            "### 任务二：带溯源的学术综述初稿\n"
+                            "基于上述表格和原文片段的逻辑脉络，撰写一段连贯的学术综述（约400-500字），梳理这些文献的研究方法演进与优劣势。\n"
+                            "**【致命要求】**：综述中的每一条结论，必须严格使用真实的原文页码与段落脚标进行引用溯源。格式例如：`（《某文献名》[P页码|段落X]）`。绝对禁止大模型编造任何未在资料中出现的虚假指标或事实。\n\n"
+                            f"### 论文资料库（仅以此为准）：\n{refs_text}"
+                        )
+                        
+                        res_matrix = llm.invoke(matrix_prompt)
+                        st.markdown(res_matrix.content)
+                        
+                        # 步骤 3：自动存入笔记系统
+                        st.session_state.notes.append({
+                            "id": str(uuid.uuid4())[:8],
+                            "content": res_matrix.content,
+                            "question": f"多文献结构化对比与综述生成：{', '.join(matrix_papers)}",
+                            "tags": ["结构化对比矩阵", "溯源文献综述", "混合检索"],
+                            "topic": st.session_state.active_topic,
+                            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        })
+                        st.success("✅ 矩阵与综述生成完毕！内容已自动为您保存至右侧的「📌 我的笔记」中。")
+                    except Exception as e:
+                        st.error(f"生成失败，请检查网络或日志：{e}")
+        st.divider()
+    # --- 【新增功能块结束】 ---
 
     # --- 2. 聊天历史回显 (原生组件) ---
     if not st.session_state.chat_history:
@@ -1159,24 +1200,92 @@ with tab_read:
                 if selected_scope != "🌐 全库综合 (对比/综述)":
                     filter_rule = {"source_paper": selected_scope}
                     search_kwargs = {"k": 20, "filter": filter_rule}
-                    status_text = f"🔍 正在深度扫描论文《{selected_scope}》..."
+                    status_text = f"🔍 正在运用混合检索管线深度扫描论文《{selected_scope}》..."
                 else:
                     search_kwargs = {"k": 15, "fetch_k": 50, "lambda_mult": 0.6}
-                    status_text = f"🔍 正在全库 {len(t['files'])} 篇论文中检索..."
+                    status_text = f"🔍 正在运用混合检索管线全库 {len(t['files'])} 篇论文中检索..."
 
                 with st.spinner(status_text):
-                    # 执行检索
-                    if filter_rule:
-                        docs = t["db"].similarity_search(prompt, **search_kwargs)
-                        # --- 修改点：单篇模式下，额外获取 SS 真实元数据以增强问答 ---
-                        ss_data = fetch_ss_paper_details_by_title(selected_scope, ss_api_key)
-                    else:
-                        docs = t["db"].max_marginal_relevance_search(prompt, **search_kwargs)
-                        ss_data = None
+                    # --- 【修改点：核心植入 - 混合检索管线 (Hybrid RAG Pipeline)】 ---
+                    try:
+                        from rank_bm25 import BM25Okapi
+                        from sentence_transformers import CrossEncoder
+                        
+                        # 步骤 1：圈定检索大池子
+                        if filter_rule:
+                            target_chunks = [c for c in t["chunks"] if c.metadata.get("source_paper") == selected_scope]
+                            ss_data = fetch_ss_paper_details_by_title(selected_scope, ss_api_key)
+                        else:
+                            target_chunks = t["chunks"]
+                            ss_data = None
+
+                        if not target_chunks:
+                            docs = []
+                        else:
+                            # 步骤 2：字面检索 (BM25) - 确保算法代号、数学公式、专有名词零遗漏
+                            # 采用粗粒度（字符或单词级别）分词构建语料库
+                            tokenized_corpus = [list(c.page_content.lower()) for c in target_chunks] 
+                            bm25 = BM25Okapi(tokenized_corpus)
+                            query_tokens = list(prompt.lower())
+                            bm25_scores = bm25.get_scores(query_tokens)
+                            # 取 BM25 结果前 50 名候选
+                            top_bm25_idx = np.argsort(bm25_scores)[::-1][:50]
+                            
+                            # 步骤 3：语义检索 (Dense Embedding) - 捕捉上下文抽象语义与同义词
+                            dense_kwargs = search_kwargs.copy()
+                            dense_kwargs["k"] = 50  # 同样扩大至前 50
+                            if "fetch_k" in dense_kwargs: del dense_kwargs["fetch_k"]
+                            if "lambda_mult" in dense_kwargs: del dense_kwargs["lambda_mult"]
+                            # 通过 Pinecone 发起密集向量召回
+                            dense_docs = t["db"].similarity_search(prompt, **dense_kwargs)
+                            
+                            # 步骤 4：排序融合 (RRF) - 消除两路检索分数值的量纲差异
+                            rrf_k = 60
+                            rrf_scores = {}
+                            
+                            # 将 BM25 排名汇入 RRF
+                            for rank, idx in enumerate(top_bm25_idx):
+                                content = target_chunks[idx].page_content
+                                rrf_scores[content] = rrf_scores.get(content, 0.0) + 1.0 / (rank + 1 + rrf_k)
+                                
+                            # 将 Dense 排名汇入 RRF
+                            for rank, d in enumerate(dense_docs):
+                                content = d.page_content
+                                rrf_scores[content] = rrf_scores.get(content, 0.0) + 1.0 / (rank + 1 + rrf_k)
+                                
+                            # 排序融合后取出最高分的前 50 组去重文本
+                            sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:50]
+                            candidate_texts = [x[0] for x in sorted_rrf]
+                            
+                            # 重新映射回原 LangChain Document 对象以便后续取 Metadata
+                            text_to_doc = {c.page_content: c for c in target_chunks}
+                            candidate_docs = [text_to_doc[txt] for txt in candidate_texts if txt in text_to_doc]
+
+                            # 步骤 5：深度重排 (Cross-Encoder Re-rank)
+                            # 调用 HuggingFace 的交叉编码器对 Query 与 Chunk 进行双向全注意力打分
+                            # 注意：此模型只有 22MB，国内网络初次运行会自动下载至缓存
+                            cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512)
+                            cross_inp = [[prompt, d.page_content] for d in candidate_docs]
+                            cross_scores = cross_encoder.predict(cross_inp)
+                            
+                            # 挑选出重排后前 5 条最精准的候选块输送给大语言模型
+                            top_cross_indices = np.argsort(cross_scores)[::-1][:5]
+                            docs = [candidate_docs[i] for i in top_cross_indices]
+                            
+                    except Exception as hybrid_err:
+                        # 降级预案：如因缺失库或其他原因导致混合管线崩溃，静默退回原始向量检索以防卡死
+                        st.warning(f"由于缺少部分依赖库(如 rank_bm25 / sentence_transformers)，混合检索退回基础向量检索模式。({hybrid_err})")
+                        if filter_rule:
+                            docs = t["db"].similarity_search(prompt, **search_kwargs)
+                            ss_data = fetch_ss_paper_details_by_title(selected_scope, ss_api_key)
+                        else:
+                            docs = t["db"].max_marginal_relevance_search(prompt, **search_kwargs)
+                            ss_data = None
+                    # --- 【混合检索修改点结束】 ---
 
                 # --- 核心优化 B：构建更智能的 Prompt ---
                 if not docs:
-                    full_response = "⚠️ 未在文档中检索到相关信息，请尝试更换关键词或检查文档是否完整。"
+                    full_response = "⚠️ 未在文档中利用混合管线检索到相关信息，请尝试更换关键词。"
                     message_placeholder.markdown(full_response)
                 else:
                     # 整理上下文，带上来源标记
@@ -1225,7 +1334,7 @@ with tab_read:
                         )
 
                     # --- 核心优化 C：调用 DeepSeek (流式) ---
-                    with st.expander("📚 查看 AI 参考的原文片段 (Sources)", expanded=False):
+                    with st.expander("📚 查看 AI (由混合管线重排推荐) 参考的原文片段", expanded=False):
                         st.markdown("\n\n".join(refs))
 
                     llm = get_deepseek_llm(USER_API_KEY, temperature=0.3)
