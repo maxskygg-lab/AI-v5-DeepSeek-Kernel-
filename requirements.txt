@@ -21,3 +21,4 @@ pandas
 sentence-transformers
 torch>=2.0.0
 torchvision
+rank_bm25 sentence-transformers
