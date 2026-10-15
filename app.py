@@ -1349,7 +1349,7 @@ with tab_read:
                     for chunk in stream:
                         if chunk.content:
                             full_response += chunk.content
-                            message_placeholder.markdown(full_response + "▌") 
+                            message_placeholder.markdown(full_response)
                     
                     message_placeholder.markdown(full_response) 
 
