@@ -1261,34 +1261,16 @@ with tab_read:
                             text_to_doc = {c.page_content: c for c in target_chunks}
                             candidate_docs = [text_to_doc[txt] for txt in candidate_texts if txt in text_to_doc]
 
-                            # 步骤 5：深度重排与多论文均衡采样 (Cross-Encoder Re-rank & Multi-paper Diversity)
+                            # 步骤 5：深度重排 (Cross-Encoder Re-rank)
+                            # 调用 HuggingFace 的交叉编码器对 Query 与 Chunk 进行双向全注意力打分
+                            # 注意：此模型只有 22MB，国内网络初次运行会自动下载至缓存
                             cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512)
                             cross_inp = [[prompt, d.page_content] for d in candidate_docs]
                             cross_scores = cross_encoder.predict(cross_inp)
                             
-                            # 将候选文档与得分绑定并按得分降序排序
-                            scored_candidates = list(zip(candidate_docs, cross_scores))
-                            scored_candidates.sort(key=lambda x: x[1], reverse=True)
-                            
-                            if selected_scope == "🌐 全库综合 (对比/综述)":
-                                # 全库综合模式：启用多论文均分采样，确保每篇论文都有代表性片段入选，防止单篇垄断
-                                docs = []
-                                paper_counts = {}
-                                max_per_paper = 2  # 每篇论文最多取 2 个核心片段
-                                for doc, score in scored_candidates:
-                                    src = doc.metadata.get('source_paper', '未知')
-                                    if paper_counts.get(src, 0) < max_per_paper:
-                                        docs.append(doc)
-                                        paper_counts[src] = paper_counts.get(src, 0) + 1
-                                    if len(docs) >= 10:  # 最多总共收集 10 个跨文献片段供对比
-                                        break
-                                # 兜底：如果没筛选出来，取前 5 个
-                                if not docs:
-                                    docs = [scored_candidates[i][0] for i in range(min(5, len(scored_candidates)))]
-                            else:
-                                # 单篇专注模式：直接取重排后的前 5 个最精准片段
-                                top_cross_indices = np.argsort(cross_scores)[::-1][:5]
-                                docs = [candidate_docs[i] for i in top_cross_indices]
+                            # 挑选出重排后前 5 条最精准的候选块输送给大语言模型
+                            top_cross_indices = np.argsort(cross_scores)[::-1][:5]
+                            docs = [candidate_docs[i] for i in top_cross_indices]
                             
                     except Exception as hybrid_err:
                         # 降级预案：如因缺失库或其他原因导致混合管线崩溃，静默退回原始向量检索以防卡死
