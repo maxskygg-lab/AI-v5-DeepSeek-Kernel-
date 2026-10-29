@@ -232,44 +232,93 @@ def get_bm25(target_chunks, cache_key):
     store[cache_key] = (sig, bm25)
     return bm25
 
+def _vector_id(v):
+    """不同 pinecone SDK 版本返回的向量对象形状不同，统一取出字符串 id。"""
+    if isinstance(v, str):
+        return v
+    if hasattr(v, "id"):
+        return v.id
+    return str(v)
+
+def _list_namespace_ids(idx, ns):
+    """版本兼容地列出 namespace 下全部向量 id（优先新版 list_paginated）。"""
+    ids = []
+    try:
+        # 新版 SDK (>=5.x)：list_paginated 返回分页响应
+        token = None
+        while True:
+            resp = (idx.list_paginated(namespace=ns, limit=1000)
+                    if token is None
+                    else idx.list_paginated(namespace=ns, limit=1000, pagination_token=token))
+            vecs = getattr(resp, "vectors", None) or getattr(resp, "ids", None) or []
+            for v in vecs:
+                ids.append(_vector_id(v))
+            token = getattr(getattr(resp, "pagination", None), "next", None)
+            if not token or len(ids) >= 20000:
+                break
+        return ids
+    except Exception:
+        pass
+    # 旧版 SDK (<5.x)：list() 直接迭代
+    ids = []
+    for batch in idx.list(namespace=ns):
+        if isinstance(batch, (list, tuple)):
+            for item in batch:
+                ids.append(_vector_id(item))
+        else:
+            ids.append(_vector_id(batch))
+        if len(ids) >= 20000:
+            break
+    return ids
+
 def restore_topic_from_pinecone(topic_name):
     """从 Pinecone 云端恢复某主题已入库的论文清单与切片，支持重开页面继续研读。"""
     t = st.session_state.topics.get(topic_name)
-    if not t or (t.get("chunks") and t.get("files")):
+    if not t:
         return
+    if t.get("chunks") and t.get("files"):
+        return
+    ns = make_namespace(topic_name)
+    api_key = PINECONE_API_KEY or ""
     try:
-        os.environ.setdefault("PINECONE_API_KEY", st.secrets["PINECONE_API_KEY"])
+        import json
         from pinecone import Pinecone
         from langchain_core.documents import Document
-        ns = make_namespace(topic_name)
-        idx = Pinecone(api_key=os.environ["PINECONE_API_KEY"]).Index(PINECONE_INDEX_NAME)
-        ids = []
-        for batch in idx.list(namespace=ns):
-            ids.extend(batch)
-            if len(ids) >= 5000:
-                break
+
+        os.environ.setdefault("PINECONE_API_KEY", api_key)
+        idx = Pinecone(api_key=api_key).Index(PINECONE_INDEX_NAME)
+        ids = _list_namespace_ids(idx, ns)
+
         if not ids:
+            st.info(f"云端主题「{topic_name}」当前没有已入库的论文（namespace={ns[:8]}…）。若刚上传过，请确认上传时提示“已加入主题”。")
             t["db"] = get_vectorstore(ns)
             return
+
         docs, files = [], []
-        for start in range(0, len(ids), 1000):
-            fetched = idx.fetch(ids=ids[start:start + 1000], namespace=ns)
-            for v in fetched.vectors.values():
-                md = dict(v.metadata or {})
-                text = md.pop("text", "")
+        for start in range(0, len(ids), 500):
+            fetched = idx.fetch(ids=ids[start:start + 500], namespace=ns)
+            vectors = getattr(fetched, "vectors", None) or {}
+            for v in vectors.values():
+                md = dict(getattr(v, "metadata", None) or {})
+                text = md.pop("text", "") or ""
                 if not text:
                     continue
                 docs.append(Document(page_content=text, metadata=md))
                 sp = md.get("source_paper")
                 if sp and sp not in files:
                     files.append(sp)
+
         if docs:
             t["chunks"], t["files"] = docs, files
             t["db"] = get_vectorstore(ns)
-    except Exception:
-        # 索引不支持 list / 网络异常：静默降级，仅保证向量库可用
+            st.success(f"已从云端恢复 {len(files)} 篇论文、{len(docs)} 个切片。")
+        else:
+            st.warning(f"云端找到 {len(ids)} 条向量，但未能还原正文（metadata 缺少 text 字段）。")
+            t["db"] = get_vectorstore(ns)
+    except Exception as e:
+        st.warning(f"从 Pinecone 恢复失败：{e}")
         try:
-            t["db"] = get_vectorstore(make_namespace(topic_name))
+            t["db"] = get_vectorstore(ns)
         except Exception:
             pass
 
