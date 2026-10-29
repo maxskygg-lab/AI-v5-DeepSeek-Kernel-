@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import os, time, tempfile, re, math, uuid, itertools, io
+import os, time, tempfile, re, math, uuid, itertools, io, hashlib
 import arxiv, requests
 import numpy as np # <--- 【修改点 1：新增 numpy 库，用于在内存中进行高效的向量矩阵余弦相似度计算】
 from datetime import datetime, timedelta
@@ -168,6 +168,63 @@ def get_deepseek_llm(api_key, temperature=0.1):
 @st.cache_resource
 def get_embeddings_model():
     return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+@st.cache_resource
+def get_cross_encoder():
+    from sentence_transformers import CrossEncoder
+    return CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512)
+
+@st.cache_resource
+def _cookie_mgr():
+    import extra_streamlit_components as stx
+    return stx.CookieManager(key="wm_cookie")
+
+def get_workspace_id():
+    # 优先：Streamlit 登录邮箱（若开启鉴权）
+    for attr in ("user", "experimental_user"):
+        try:
+            email = getattr(getattr(st, attr), "email", None)
+            if email:
+                return hashlib.sha1(email.encode()).hexdigest()[:16]
+        except Exception:
+            pass
+    # 回退：浏览器持久 cookie（同一浏览器稳定不变）
+    try:
+        cm = _cookie_mgr()
+        cid = cm.get("wm_client_id")
+        if not cid:
+            cid = uuid.uuid4().hex
+            cm.set("wm_client_id", cid, expires_at=datetime.now() + timedelta(days=365))
+        return hashlib.sha1(cid.encode()).hexdigest()[:16]
+    except Exception:
+        # 极端兜底：按当前 session 隔离
+        if "wm_session_id" not in st.session_state:
+            st.session_state["wm_session_id"] = uuid.uuid4().hex
+        return hashlib.sha1(st.session_state["wm_session_id"].encode()).hexdigest()[:16]
+
+def make_namespace(topic_name):
+    return hashlib.sha1(f"{get_workspace_id()}:{topic_name}".encode("utf-8")).hexdigest()
+
+@st.cache_resource
+def get_vectorstore(namespace):
+    return PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=get_embeddings_model(), namespace=namespace)
+
+def get_bm25(target_chunks, cache_key):
+    if "_bm25_cache" not in st.session_state:
+        st.session_state["_bm25_cache"] = {}
+    store = st.session_state["_bm25_cache"]
+    sig = hashlib.sha1(
+        "|".join([str(len(target_chunks)),
+                  target_chunks[0].page_content[:80] if target_chunks else "",
+                  target_chunks[-1].page_content[-80:] if target_chunks else ""]).encode()
+    ).hexdigest()
+    hit = store.get(cache_key)
+    if hit and hit[0] == sig:
+        return hit[1]
+    from rank_bm25 import BM25Okapi
+    bm25 = BM25Okapi([list(c.page_content.lower()) for c in target_chunks])
+    store[cache_key] = (sig, bm25)
+    return bm25
 
 def active_topic_data():
     return st.session_state.topics[st.session_state.active_topic]
@@ -465,8 +522,8 @@ def process_and_add_to_topic(file_path, file_name, api_key, topic_name=None):
         
         if t["db"] is None:
             # 初始化连接云端索引，按主题划分 namespace（转码为 ASCII 兼容格式）
-            safe_namespace = topic_name.encode('utf-8').hex()
-            t["db"] = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings, namespace=safe_namespace)
+            safe_namespace = make_namespace(topic_name)
+            t["db"] = get_vectorstore(safe_namespace)
             
         # 直接向 Pinecone 批量添加文档向量
         for i in range(0, len(chunks), batch):
@@ -492,8 +549,8 @@ def rebuild_topic_index(topic_name, api_key):
     import os
     if PINECONE_API_KEY:
         os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
-    safe_namespace = topic_name.encode('utf-8').hex()
-    t["db"] = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings, namespace=safe_namespace)
+    safe_namespace = make_namespace(topic_name)
+    t["db"] = get_vectorstore(safe_namespace)
 
 def detect_knowledge_gap(answer_text, docs):
     sigs = ["资料不足","没有找到","无法回答","未提及","不清楚","没有相关","cannot find","not mentioned"]
@@ -625,7 +682,7 @@ with st.sidebar:
             # --- 修改点：连带清空 Pinecone 该主题的 namespace ---
             if ts["db"]:
                 try:
-                    safe_namespace = st.session_state.active_topic.encode('utf-8').hex()
+                    safe_namespace = make_namespace(st.session_state.active_topic)
                     ts["db"].delete(delete_all=True, namespace=safe_namespace)
                 except Exception: pass
             ts["files"],ts["chunks"],ts["db"] = [],[],None
@@ -1252,8 +1309,7 @@ with tab_read:
                         else:
                             # 步骤 2：字面检索 (BM25) - 确保算法代号、数学公式、专有名词零遗漏
                             # 采用粗粒度（字符或单词级别）分词构建语料库
-                            tokenized_corpus = [list(c.page_content.lower()) for c in target_chunks] 
-                            bm25 = BM25Okapi(tokenized_corpus)
+                            bm25 = get_bm25(target_chunks, f"{st.session_state.active_topic}:{selected_scope}")
                             query_tokens = list(prompt.lower())
                             bm25_scores = bm25.get_scores(query_tokens)
                             # 取 BM25 结果前 50 名候选
@@ -1292,7 +1348,7 @@ with tab_read:
                             # 步骤 5：深度重排 (Cross-Encoder Re-rank)
                             # 调用 HuggingFace 的交叉编码器对 Query 与 Chunk 进行双向全注意力打分
                             # 注意：此模型只有 22MB，国内网络初次运行会自动下载至缓存
-                            cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512)
+                            cross_encoder = get_cross_encoder()
                             cross_inp = [[prompt, d.page_content] for d in candidate_docs]
                             cross_scores = cross_encoder.predict(cross_inp)
                             
