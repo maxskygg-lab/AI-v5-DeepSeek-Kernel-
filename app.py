@@ -235,6 +235,12 @@ def _vector_id(v):
         return v.id
     return str(v)
 
+def _ns_vector_count(v):
+    """兼容 describe_index_stats().namespaces 的两种返回形状：dict / NamespaceDescription 对象。"""
+    if isinstance(v, dict):
+        return int(v.get("vector_count", 0) or 0)
+    return int(getattr(v, "vector_count", 0) or 0)
+
 def _list_namespace_ids(idx, ns):
     """版本兼容地列出 namespace 下全部向量 id（优先新版 list_paginated）。"""
     ids = []
@@ -266,7 +272,7 @@ def _list_namespace_ids(idx, ns):
             break
     return ids
 
-def restore_topic_from_pinecone(topic_name):
+def restore_topic_from_pinecone(topic_name, verbose=False):
     """从 Pinecone 云端恢复某主题已入库的论文清单与切片，支持重开页面继续研读。"""
     t = st.session_state.topics.get(topic_name)
     if not t:
@@ -285,19 +291,19 @@ def restore_topic_from_pinecone(topic_name):
         ids = _list_namespace_ids(idx, ns)
 
         if not ids:
-            # 诊断：把本应用查询的 namespace 与索引中真实存在的 namespace 都列出来
-            exist = {}
-            try:
-                stats = idx.describe_index_stats()
-                ns_map = getattr(stats, "namespaces", None) or {}
-                exist = {k: (v.get("vector_count") if isinstance(v, dict) else v) for k, v in ns_map.items()}
-            except Exception as e:
-                exist = {"__err__": str(e)}
-            st.error(
-                f"云端主题「{topic_name}」查询到的 namespace 为空。\n\n"
-                f"本应用应查 namespace = `{ns}`\n\n"
-                f"索引中真实存在的 namespace / 记录数 = `{exist}`"
-            )
+            if verbose:
+                exist = {}
+                try:
+                    stats = idx.describe_index_stats()
+                    ns_map = getattr(stats, "namespaces", None) or {}
+                    exist = {k: _ns_vector_count(v) for k, v in ns_map.items()}
+                except Exception as e:
+                    exist = {"__err__": str(e)}
+                st.info(
+                    f"云端主题「{topic_name}」暂无数据。\n\n"
+                    f"本应用应查 namespace = `{ns}`\n\n"
+                    f"索引现有 namespace / 记录数 = `{exist}`"
+                )
             t["db"] = get_vectorstore(ns)
             return
 
@@ -338,8 +344,8 @@ def migrate_legacy_namespaces(topic_name):
     idx = Pinecone(api_key=api_key).Index(PINECONE_INDEX_NAME)
     stats = idx.describe_index_stats()
     ns_map = getattr(stats, "namespaces", None) or {}
-    src = [k for k, v in ns_map.items()
-           if k != ns and (v.get("vector_count") if isinstance(v, dict) else v) > 0]
+    src = [k for k, v in ns_map.items() if k != ns and _ns_vector_count(v) > 0]
+    legacy_ns = {topic_name.encode("utf-8").hex(), "ns_" + topic_name.encode("utf-8").hex()}
 
     unique = {}
     for s in src:
@@ -353,6 +359,9 @@ def migrate_legacy_namespaces(topic_name):
                 md = dict(getattr(v, "metadata", None) or {})
                 text = (md.get("text") or "").strip()
                 if not text:
+                    continue
+                # 只迁移属于当前主题的数据，避免把其它主题搬进来
+                if md.get("topic") != topic_name and s not in legacy_ns:
                     continue
                 h = hashlib.sha1(text.encode("utf-8")).hexdigest()
                 if h in unique:
@@ -826,7 +835,7 @@ with st.sidebar:
     if not ts["files"]:
         if st.button("🔄 从云端恢复本主题", help="重开页面后拉取已入库论文"):
             with st.spinner("恢复中..."):
-                restore_topic_from_pinecone(st.session_state.active_topic)
+                restore_topic_from_pinecone(st.session_state.active_topic, verbose=True)
             st.rerun()
         if st.button("🛠 迁移旧数据到当前主题", help="把散落在旧 namespace 的论文去重后搬入本主题（一次性维护）"):
             with st.spinner("正在迁移旧 namespace 数据..."):
@@ -834,7 +843,7 @@ with st.sidebar:
             if _n:
                 st.success(f"迁移完成：写入 {_n} 个唯一切片")
             with st.spinner("正在恢复..."):
-                restore_topic_from_pinecone(st.session_state.active_topic)
+                restore_topic_from_pinecone(st.session_state.active_topic, verbose=True)
             st.rerun()
     if ts["files"]:
         st.markdown(f"**已入库（{len(ts['files'])}篇）**")
