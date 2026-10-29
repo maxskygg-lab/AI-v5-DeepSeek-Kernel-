@@ -174,12 +174,7 @@ def get_cross_encoder():
     from sentence_transformers import CrossEncoder
     return CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512)
 
-@st.cache_resource
-def _cookie_mgr():
-    import extra_streamlit_components as stx
-    return stx.CookieManager(key="wm_cookie")
-
-def get_workspace_id():
+def _resolve_workspace_id():
     # 优先：Streamlit 登录邮箱（若开启鉴权）
     for attr in ("user", "experimental_user"):
         try:
@@ -189,18 +184,29 @@ def get_workspace_id():
         except Exception:
             pass
     # 回退：浏览器持久 cookie（同一浏览器稳定不变）
-    try:
-        cm = _cookie_mgr()
-        cid = cm.get("wm_client_id")
-        if not cid:
-            cid = uuid.uuid4().hex
-            cm.set("wm_client_id", cid, expires_at=datetime.now() + timedelta(days=365))
-        return hashlib.sha1(cid.encode()).hexdigest()[:16]
-    except Exception:
-        # 极端兜底：按当前 session 隔离
-        if "wm_session_id" not in st.session_state:
-            st.session_state["wm_session_id"] = uuid.uuid4().hex
-        return hashlib.sha1(st.session_state["wm_session_id"].encode()).hexdigest()[:16]
+    import extra_streamlit_components as stx
+    cm = stx.CookieManager(key="wm_cookie")
+    cid = cm.get("wm_client_id")
+    if not cid:
+        cid = uuid.uuid4().hex
+        cm.set("wm_client_id", cid, expires_at=datetime.now() + timedelta(days=365))
+    return hashlib.sha1(cid.encode()).hexdigest()[:16]
+
+def get_workspace_id():
+    # 每个会话只解析一次，避免重复创建 CookieManager 组件
+    if "wm_workspace_id" not in st.session_state:
+        try:
+            st.session_state["wm_workspace_id"] = _resolve_workspace_id()
+        except Exception:
+            # 极端兜底：按当前 session 隔离
+            if "wm_session_id" not in st.session_state:
+                st.session_state["wm_session_id"] = uuid.uuid4().hex
+            st.session_state["wm_workspace_id"] = hashlib.sha1(
+                st.session_state["wm_session_id"].encode()).hexdigest()[:16]
+    return st.session_state["wm_workspace_id"]
+
+# 预热：让 CookieManager 组件在页面顶部稳定渲染一次（避免创建在缓存函数/业务流中间）
+_ = get_workspace_id()
 
 def make_namespace(topic_name):
     return hashlib.sha1(f"{get_workspace_id()}:{topic_name}".encode("utf-8")).hexdigest()
