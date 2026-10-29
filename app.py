@@ -174,39 +174,34 @@ def get_cross_encoder():
     from sentence_transformers import CrossEncoder
     return CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512)
 
-def _resolve_workspace_id():
-    # 优先：Streamlit 登录邮箱（若开启鉴权）
-    for attr in ("user", "experimental_user"):
-        try:
-            email = getattr(getattr(st, attr), "email", None)
-            if email:
-                return hashlib.sha1(email.encode()).hexdigest()[:16]
-        except Exception:
-            pass
-    # 回退：浏览器持久 cookie（同一浏览器稳定不变）
-    import extra_streamlit_components as stx
-    cm = stx.CookieManager(key="wm_cookie")
-    cid = cm.get("wm_client_id")
-    if not cid:
-        cid = uuid.uuid4().hex
-        cm.set("wm_client_id", cid, expires_at=datetime.now() + timedelta(days=365))
-    return hashlib.sha1(cid.encode()).hexdigest()[:16]
-
 def get_workspace_id():
-    # 每个会话只解析一次，避免重复创建 CookieManager 组件
-    if "wm_workspace_id" not in st.session_state:
-        try:
-            st.session_state["wm_workspace_id"] = _resolve_workspace_id()
-        except Exception:
-            # 极端兜底：按当前 session 隔离
-            if "wm_session_id" not in st.session_state:
-                st.session_state["wm_session_id"] = uuid.uuid4().hex
-            st.session_state["wm_workspace_id"] = hashlib.sha1(
-                st.session_state["wm_session_id"].encode()).hexdigest()[:16]
-    return st.session_state["wm_workspace_id"]
-
-# 预热：让 CookieManager 组件在页面顶部稳定渲染一次（避免创建在缓存函数/业务流中间）
-_ = get_workspace_id()
+    """稳定的工作区标识（跨会话不变），用于 namespace 隔离。
+    优先级：secrets 的 WORKSPACE_ID > 登录邮箱 > 固定兜底。绝不使用随机值，
+    否则每次刷新页面 namespace 都会变，导致上传的数据“消失”。"""
+    if "wm_workspace_id" in st.session_state:
+        return st.session_state["wm_workspace_id"]
+    wid = None
+    # 1) 显式配置（最稳定，推荐在 secrets 里设置 WORKSPACE_ID）
+    try:
+        if "WORKSPACE_ID" in st.secrets and str(st.secrets["WORKSPACE_ID"]).strip():
+            wid = hashlib.sha1(str(st.secrets["WORKSPACE_ID"]).strip().encode()).hexdigest()[:16]
+    except Exception:
+        pass
+    # 2) 登录邮箱（启用鉴权时可按用户隔离）
+    if not wid:
+        for attr in ("user", "experimental_user"):
+            try:
+                email = getattr(getattr(st, attr), "email", None)
+                if email:
+                    wid = hashlib.sha1(email.encode()).hexdigest()[:16]
+                    break
+            except Exception:
+                pass
+    # 3) 固定兜底（保证跨会话稳定，不使用随机 uuid）
+    if not wid:
+        wid = "default"
+    st.session_state["wm_workspace_id"] = wid
+    return wid
 
 def make_namespace(topic_name):
     return hashlib.sha1(f"{get_workspace_id()}:{topic_name}".encode("utf-8")).hexdigest()
@@ -290,7 +285,19 @@ def restore_topic_from_pinecone(topic_name):
         ids = _list_namespace_ids(idx, ns)
 
         if not ids:
-            st.info(f"云端主题「{topic_name}」当前没有已入库的论文（namespace={ns[:8]}…）。若刚上传过，请确认上传时提示“已加入主题”。")
+            # 诊断：把本应用查询的 namespace 与索引中真实存在的 namespace 都列出来
+            exist = {}
+            try:
+                stats = idx.describe_index_stats()
+                ns_map = getattr(stats, "namespaces", None) or {}
+                exist = {k: (v.get("vector_count") if isinstance(v, dict) else v) for k, v in ns_map.items()}
+            except Exception as e:
+                exist = {"__err__": str(e)}
+            st.error(
+                f"云端主题「{topic_name}」查询到的 namespace 为空。\n\n"
+                f"本应用应查 namespace = `{ns}`\n\n"
+                f"索引中真实存在的 namespace / 记录数 = `{exist}`"
+            )
             t["db"] = get_vectorstore(ns)
             return
 
