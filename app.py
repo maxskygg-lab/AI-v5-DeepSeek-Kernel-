@@ -329,6 +329,56 @@ def restore_topic_from_pinecone(topic_name):
         except Exception:
             pass
 
+def migrate_legacy_namespaces(topic_name):
+    """把散落在旧 namespace 的向量，按正文去重后搬到当前稳定 namespace（不动旧数据）。"""
+    ns = make_namespace(topic_name)
+    api_key = PINECONE_API_KEY or ""
+    os.environ.setdefault("PINECONE_API_KEY", api_key)
+    from pinecone import Pinecone
+    idx = Pinecone(api_key=api_key).Index(PINECONE_INDEX_NAME)
+    stats = idx.describe_index_stats()
+    ns_map = getattr(stats, "namespaces", None) or {}
+    src = [k for k, v in ns_map.items()
+           if k != ns and (v.get("vector_count") if isinstance(v, dict) else v) > 0]
+
+    unique = {}
+    for s in src:
+        try:
+            ids = _list_namespace_ids(idx, s)
+            vecs = {}
+            for start in range(0, len(ids), 500):
+                fetched = idx.fetch(ids=ids[start:start + 500], namespace=s)
+                vecs.update(getattr(fetched, "vectors", None) or {})
+            for _vid, v in vecs.items():
+                md = dict(getattr(v, "metadata", None) or {})
+                text = (md.get("text") or "").strip()
+                if not text:
+                    continue
+                h = hashlib.sha1(text.encode("utf-8")).hexdigest()
+                if h in unique:
+                    continue
+                sp = md.get("source_paper") or "迁移论文"
+                new_md = {"source_paper": sp, "topic": topic_name, "text": text}
+                if isinstance(md.get("page"), (int, float)):
+                    new_md["page"] = int(md["page"])
+                vals = getattr(v, "values", None)
+                if not vals:
+                    continue
+                unique[h] = {"id": "mig_" + h[:32], "values": list(vals), "metadata": new_md}
+        except Exception as e:
+            st.warning(f"跳过旧 namespace {s[:8]}…：{e}")
+
+    if not unique:
+        return 0
+    items = list(unique.values())
+    for i in range(0, len(items), 100):
+        batch = items[i:i + 100]
+        try:
+            idx.upsert(vectors=batch, namespace=ns)
+        except Exception:
+            idx.upsert(vectors=[(b["id"], b["values"], b["metadata"]) for b in batch], namespace=ns)
+    return len(items)
+
 def active_topic_data():
     return st.session_state.topics[st.session_state.active_topic]
 
@@ -776,6 +826,14 @@ with st.sidebar:
     if not ts["files"]:
         if st.button("🔄 从云端恢复本主题", help="重开页面后拉取已入库论文"):
             with st.spinner("恢复中..."):
+                restore_topic_from_pinecone(st.session_state.active_topic)
+            st.rerun()
+        if st.button("🛠 迁移旧数据到当前主题", help="把散落在旧 namespace 的论文去重后搬入本主题（一次性维护）"):
+            with st.spinner("正在迁移旧 namespace 数据..."):
+                _n = migrate_legacy_namespaces(st.session_state.active_topic)
+            if _n:
+                st.success(f"迁移完成：写入 {_n} 个唯一切片")
+            with st.spinner("正在恢复..."):
                 restore_topic_from_pinecone(st.session_state.active_topic)
             st.rerun()
     if ts["files"]:
