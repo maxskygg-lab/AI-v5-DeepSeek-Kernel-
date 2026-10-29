@@ -101,17 +101,22 @@ st.markdown("""
 st.title("📖 AI 深度研读助手 v5 (DeepSeek Kernel)")
 
 # ================= API Key =================
-# --- 修改点：适配 DeepSeek Key ---
-try:
-    USER_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
-except:
-    USER_API_KEY = "" # 避免报错，可在侧边栏提示用户
+# 优先读取 Streamlit Secrets，本地运行时回退到系统环境变量
+def _get_secret(name, default=""):
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.getenv(name, default)
 
-SS_API_KEY = st.secrets.get("SS_API_KEY", "")
+# --- 修改点：适配 DeepSeek Key ---
+USER_API_KEY = _get_secret("DEEPSEEK_API_KEY")
+SS_API_KEY = _get_secret("SS_API_KEY")
 
 # --- 修改点：新增 Pinecone 配置 ---
-PINECONE_API_KEY = st.secrets.get("PINECONE_API_KEY", "")
-PINECONE_INDEX_NAME = st.secrets.get("PINECONE_INDEX_NAME", "arxiv-papers")
+PINECONE_API_KEY = _get_secret("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = _get_secret("PINECONE_INDEX_NAME", "arxiv-papers")
 
 # ================= 3. 状态初始化 =================
 defaults = {
@@ -1268,9 +1273,30 @@ with tab_read:
                             cross_inp = [[prompt, d.page_content] for d in candidate_docs]
                             cross_scores = cross_encoder.predict(cross_inp)
                             
-                            # 挑选出重排后前 5 条最精准的候选块输送给大语言模型
-                            top_cross_indices = np.argsort(cross_scores)[::-1][:5]
-                            docs = [candidate_docs[i] for i in top_cross_indices]
+                            # 挑选出重排后的候选块输送给大语言模型
+                            top_cross_indices = np.argsort(cross_scores)[::-1]
+                            docs, chosen = [], set()
+
+                            if selected_scope == "🌐 全库综合 (对比/综述)":
+                                seen_papers = set()
+                                # 第一轮：每篇论文只保留最高分的一个块，保证跨论文覆盖
+                                for i in top_cross_indices:
+                                    if len(docs) >= 5:
+                                        break
+                                    d = candidate_docs[i]
+                                    src = d.metadata.get("source_paper", "未知")
+                                    if src in seen_papers:
+                                        continue
+                                    seen_papers.add(src)
+                                    docs.append(d); chosen.add(i)
+                                # 第二轮：候选覆盖的论文不足 5 篇时，用剩余高分块补齐
+                                for i in top_cross_indices:
+                                    if len(docs) >= 5:
+                                        break
+                                    if i not in chosen:
+                                        docs.append(candidate_docs[i]); chosen.add(i)
+                            else:
+                                docs = [candidate_docs[i] for i in top_cross_indices[:5]]
                             
                     except Exception as hybrid_err:
                         # 降级预案：如因缺失库或其他原因导致混合管线崩溃，静默退回原始向量检索以防卡死
