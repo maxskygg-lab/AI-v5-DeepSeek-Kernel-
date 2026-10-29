@@ -415,6 +415,21 @@ def fix_latex(text):
     if not text: return text
     return text.replace(r"\(","$").replace(r"\)","$").replace(r"\[","$$").replace(r"\]","$$")
 
+def _extract_text_with_fitz(file_path, file_name, topic_name):
+    """PyPDF 提取不到文字时回退到 PyMuPDF，兼容扫描版/特殊编码 PDF。"""
+    from langchain_core.documents import Document
+    docs = []
+    with fitz.open(file_path) as pdf:
+        for i, page in enumerate(pdf):
+            txt = page.get_text()
+            if txt and txt.strip():
+                docs.append(Document(
+                    page_content=txt,
+                    metadata={"source_paper": file_name, "topic": topic_name, "page": i},
+                ))
+    return docs
+
+
 def process_and_add_to_topic(file_path, file_name, api_key, topic_name=None):
     topic_name = topic_name or st.session_state.active_topic
     t = st.session_state.topics[topic_name]
@@ -424,11 +439,19 @@ def process_and_add_to_topic(file_path, file_name, api_key, topic_name=None):
         for doc in docs:
             doc.metadata['source_paper'] = file_name
             doc.metadata['topic'] = topic_name
+        # 若 pypdf 未能提取文字（如扫描版 PDF），回退到 PyMuPDF
+        if not docs or not any(d.page_content.strip() for d in docs):
+            docs = _extract_text_with_fitz(file_path, file_name, topic_name)
+
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=600, chunk_overlap=200,
             separators=["\n\n","\n","。","."," ",""]
         )
         chunks = [c for c in splitter.split_documents(docs) if len(c.page_content.strip()) > 20]
+
+        if not chunks:
+            st.error(f"🚫 《{file_name}》未能提取到任何文字（可能是扫描版 PDF 或文件已损坏），已跳过入库，未加入可检索内容。")
+            return False
         t["chunks"].extend(chunks)
         
         # --- 修改点：使用 HuggingFace 免费向量 ---
