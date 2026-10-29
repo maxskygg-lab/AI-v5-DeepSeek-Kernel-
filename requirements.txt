@@ -24,3 +24,4 @@ torchvision
 sentence-transformers
 rank-bm25
 numpy
+extra-streamlit-components
