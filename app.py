@@ -226,6 +226,47 @@ def get_bm25(target_chunks, cache_key):
     store[cache_key] = (sig, bm25)
     return bm25
 
+def restore_topic_from_pinecone(topic_name):
+    """从 Pinecone 云端恢复某主题已入库的论文清单与切片，支持重开页面继续研读。"""
+    t = st.session_state.topics.get(topic_name)
+    if not t or (t.get("chunks") and t.get("files")):
+        return
+    try:
+        os.environ.setdefault("PINECONE_API_KEY", st.secrets["PINECONE_API_KEY"])
+        from pinecone import Pinecone
+        from langchain_core.documents import Document
+        ns = make_namespace(topic_name)
+        idx = Pinecone(api_key=os.environ["PINECONE_API_KEY"]).Index(PINECONE_INDEX_NAME)
+        ids = []
+        for batch in idx.list(namespace=ns):
+            ids.extend(batch)
+            if len(ids) >= 5000:
+                break
+        if not ids:
+            t["db"] = get_vectorstore(ns)
+            return
+        docs, files = [], []
+        for start in range(0, len(ids), 1000):
+            fetched = idx.fetch(ids=ids[start:start + 1000], namespace=ns)
+            for v in fetched.vectors.values():
+                md = dict(v.metadata or {})
+                text = md.pop("text", "")
+                if not text:
+                    continue
+                docs.append(Document(page_content=text, metadata=md))
+                sp = md.get("source_paper")
+                if sp and sp not in files:
+                    files.append(sp)
+        if docs:
+            t["chunks"], t["files"] = docs, files
+            t["db"] = get_vectorstore(ns)
+    except Exception:
+        # 索引不支持 list / 网络异常：静默降级，仅保证向量库可用
+        try:
+            t["db"] = get_vectorstore(make_namespace(topic_name))
+        except Exception:
+            pass
+
 def active_topic_data():
     return st.session_state.topics[st.session_state.active_topic]
 
@@ -663,6 +704,18 @@ with st.sidebar:
             st.session_state.active_topic = list(st.session_state.topics.keys())[0]; st.rerun()
 
     ts = active_topic_data()
+    # 启动时从云端自动恢复一次本主题的已入库论文（重开页面可继续研读）
+    _rk = f"_restored_{st.session_state.active_topic}"
+    if not ts["files"] and not st.session_state.get(_rk):
+        st.session_state[_rk] = True
+        with st.spinner("正在从云端恢复已入库论文..."):
+            restore_topic_from_pinecone(st.session_state.active_topic)
+            ts = active_topic_data()
+    if not ts["files"]:
+        if st.button("🔄 从云端恢复本主题", help="重开页面后拉取已入库论文"):
+            with st.spinner("恢复中..."):
+                restore_topic_from_pinecone(st.session_state.active_topic)
+            st.rerun()
     if ts["files"]:
         st.markdown(f"**已入库（{len(ts['files'])}篇）**")
         for f in list(ts["files"]):
