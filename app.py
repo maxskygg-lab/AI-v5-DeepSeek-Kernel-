@@ -134,6 +134,9 @@ defaults = {
     "selected_scope":         "🌐 对比所有论文",
     "notes":                  [],
     "pending_note":           None,
+    "notes_synced":           False,   # 本次会话是否已从云端拉取过笔记
+    "notes_unsynced":         [],      # 尚未成功写入云端、待重试的笔记
+    "notes_last_error":       None,
     "graph_references_cache": [],
     "preload_done_ids":       set(),
 }
@@ -390,6 +393,156 @@ def migrate_legacy_namespaces(topic_name):
 
 def active_topic_data():
     return st.session_state.topics[st.session_state.active_topic]
+
+# ================= 笔记云端持久化 =================
+def _pinecone_index():
+    """统一获取 Pinecone Index 句柄（与主题数据共用同一索引）。"""
+    from pinecone import Pinecone
+    os.environ.setdefault("PINECONE_API_KEY", PINECONE_API_KEY or "")
+    return Pinecone(api_key=PINECONE_API_KEY or "").Index(PINECONE_INDEX_NAME)
+
+def _notes_namespace():
+    """笔记使用独立 namespace：按工作区隔离、跨主题共享（主题记录在笔记自身的 topic 字段）。"""
+    return "notes-" + hashlib.sha1(f"{get_workspace_id()}:notes".encode()).hexdigest()[:32]
+
+def _retry_cloud(fn, times=3, delay=0.6):
+    """网络抖动重试：0.6s → 1.2s 指数退避，缓解瞬时失败。"""
+    last = None
+    for i in range(times):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i < times - 1:
+                time.sleep(delay * (2 ** i))
+    raise last
+
+def _note_to_metadata(note):
+    return {
+        "type": "note",
+        "note_id": str(note.get("id") or ""),
+        "content": note.get("content") or "",
+        "question": note.get("question") or "",
+        "tags": ",".join(str(t) for t in (note.get("tags") or [])),
+        "topic": note.get("topic") or "",
+        "ts": note.get("ts") or "",
+    }
+
+def _metadata_to_note(md):
+    tags = md.get("tags") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    return {
+        "id": str(md.get("note_id") or ""),
+        "content": md.get("content") or "",
+        "question": md.get("question") or "",
+        "tags": [str(t) for t in tags],
+        "topic": md.get("topic") or "",
+        "ts": md.get("ts") or "",
+    }
+
+def save_note_to_cloud(note):
+    """把单条笔记写入云端。失败不抛异常，登记到待重试队列，保证内容不丢。"""
+    nid = str(note.get("id") or "")
+    text = f"{note.get('question') or ''}\n{note.get('content') or ''}".strip() or "空笔记"
+    try:
+        vec = get_embeddings_model().embed_query(text[:4000])
+        ns = _notes_namespace()
+        md = _note_to_metadata(note)
+
+        def _do():
+            idx = _pinecone_index()
+            try:
+                idx.upsert(vectors=[{"id": nid, "values": vec, "metadata": md}], namespace=ns)
+            except Exception:
+                idx.upsert(vectors=[(nid, vec, md)], namespace=ns)
+
+        _retry_cloud(_do)
+        st.session_state["notes_unsynced"] = [
+            n for n in st.session_state.get("notes_unsynced", []) if str(n.get("id")) != nid
+        ]
+        st.session_state["notes_last_error"] = None
+        return True
+    except Exception as e:
+        st.session_state["notes_last_error"] = str(e)
+        pending_ids = {str(n.get("id")) for n in st.session_state.get("notes_unsynced", [])}
+        if nid not in pending_ids:
+            st.session_state.setdefault("notes_unsynced", []).append(note)
+        return False
+
+def delete_notes_in_cloud(note_ids):
+    """按 id 删除云端笔记；失败仅记录，不打断界面操作。"""
+    ids = [str(i) for i in note_ids if i]
+    if not ids:
+        return True
+    ns = _notes_namespace()
+    try:
+        _retry_cloud(lambda: _pinecone_index().delete(ids=ids, namespace=ns))
+        st.session_state["notes_last_error"] = None
+        return True
+    except Exception as e:
+        st.session_state["notes_last_error"] = str(e)
+        return False
+
+def clear_notes_in_cloud():
+    """清空云端笔记 namespace（先列出 id 再批量删除）。"""
+    ns = _notes_namespace()
+    try:
+        idx = _pinecone_index()
+        ids = _list_namespace_ids(idx, ns)
+        for start in range(0, len(ids), 500):
+            batch = ids[start:start + 500]
+            _retry_cloud(lambda: idx.delete(ids=batch, namespace=ns))
+        st.session_state["notes_last_error"] = None
+        return True
+    except Exception as e:
+        st.session_state["notes_last_error"] = str(e)
+        return False
+
+def load_notes_from_cloud():
+    """读取云端全部笔记，返回按时间升序的列表。"""
+    ns = _notes_namespace()
+    idx = _pinecone_index()
+    ids = _list_namespace_ids(idx, ns)
+    notes = []
+    for start in range(0, len(ids), 500):
+        fetched = idx.fetch(ids=ids[start:start + 500], namespace=ns)
+        for v in (getattr(fetched, "vectors", None) or {}).values():
+            md = dict(getattr(v, "metadata", None) or {})
+            if md.get("type") != "note":
+                continue
+            n = _metadata_to_note(md)
+            if n["id"] and n["content"]:
+                notes.append(n)
+    notes.sort(key=lambda n: n.get("ts") or "")
+    return notes
+
+def sync_notes_from_cloud():
+    """云端 → 本地合并：同 id 以云端为准，本地尚未上传的笔记保留。失败时抛异常由调用方提示。"""
+    cloud = load_notes_from_cloud()
+    by_id = {str(n.get("id")): n for n in st.session_state.notes}
+    for n in cloud:
+        by_id[str(n["id"])] = n
+    st.session_state.notes = sorted(by_id.values(), key=lambda n: n.get("ts") or "")
+    st.session_state["notes_synced"] = True
+    return len(cloud)
+
+def retry_unsynced_notes():
+    """把上次写入失败的笔记补传云端（网络恢复后自动补漏）。"""
+    for n in list(st.session_state.get("notes_unsynced", [])):
+        save_note_to_cloud(n)
+
+# --- 启动时同步云端笔记（每个会话一次；失败不阻塞应用启动） ---
+if not st.session_state.get("notes_synced"):
+    try:
+        with st.spinner("正在同步云端笔记..."):
+            sync_notes_from_cloud()
+        retry_unsynced_notes()
+    except Exception as e:
+        # 标记已尝试，避免每次交互都重复联网；失败后可点「同步云端笔记」手动重试
+        st.session_state["notes_synced"] = True
+        st.session_state["notes_last_error"] = str(e)
+
 
 def get_pure_arxiv_id(url_or_id):
     m = re.search(r'(\d{4}\.\d{4,5})', url_or_id)
@@ -1413,16 +1566,20 @@ with tab_read:
                         res_matrix = llm.invoke(matrix_prompt)
                         st.markdown(res_matrix.content)
                         
-                        # 步骤 3：自动存入笔记系统
-                        st.session_state.notes.append({
+                        # 步骤 3：自动存入笔记系统（同时写入云端，刷新后可恢复）
+                        new_note = {
                             "id": str(uuid.uuid4())[:8],
                             "content": res_matrix.content,
                             "question": f"多文献结构化对比与综述生成：{', '.join(matrix_papers)}",
                             "tags": ["结构化对比矩阵", "溯源文献综述", "混合检索"],
                             "topic": st.session_state.active_topic,
                             "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        })
-                        st.success("✅ 矩阵与综述生成完毕！内容已自动为您保存至右侧的「📌 我的笔记」中。")
+                        }
+                        st.session_state.notes.append(new_note)
+                        if save_note_to_cloud(new_note):
+                            st.success("✅ 矩阵与综述生成完毕！内容已自动保存至「📌 我的笔记」（云端已同步）。")
+                        else:
+                            st.warning("⚠️ 内容已保存在当前页面，但云端同步失败，将自动重试；也可在「📌 我的笔记」页手动同步。")
                     except Exception as e:
                         st.error(f"生成失败，请检查网络或日志：{e}")
         st.divider()
@@ -1660,25 +1817,48 @@ with tab_read:
             st.write("") 
             if st.button("📌 存笔记"):
                 tags = [t.strip() for t in note_tags.split(",")] if note_tags else []
-                st.session_state.notes.append({
+                new_note = {
                     "id": str(uuid.uuid4())[:8],
                     "content": st.session_state.pending_note["content"],
                     "question": st.session_state.pending_note["question"],
                     "tags": tags,
                     "topic": st.session_state.active_topic,
                     "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                })
+                }
+                st.session_state.notes.append(new_note)
                 st.session_state.pending_note = None
-                st.toast("笔记保存成功！", icon="🎉")
+                if save_note_to_cloud(new_note):
+                    st.toast("笔记已保存并同步到云端！", icon="🎉")
+                else:
+                    st.toast("笔记已保存到本页，云端同步失败，稍后自动重试", icon="⚠️")
                 st.rerun()
 
 # ══════════════════════════════════════════
 # Tab 3：我的笔记
 # ══════════════════════════════════════════
 with tab_notes:
-    st.subheader("📌 我的笔记库")
+    c_title, c_sync = st.columns([4, 1])
+    with c_title:
+        st.subheader("📌 我的笔记库")
+    with c_sync:
+        st.write("")
+        if st.button("🔄 同步云端笔记", help="重新从云端拉取并合并本工作区的笔记"):
+            try:
+                with st.spinner("同步中..."):
+                    n_cloud = sync_notes_from_cloud()
+                    retry_unsynced_notes()
+                st.toast(f"已同步 {n_cloud} 条云端笔记", icon="✅")
+            except Exception as e:
+                st.session_state["notes_last_error"] = str(e)
+                st.error(f"云端同步失败：{e}")
+    if st.session_state.get("notes_last_error"):
+        st.caption(
+            f"⚠️ 最近一次云端同步失败：{st.session_state['notes_last_error']}。"
+            "笔记内容仍保留在当前页面，可点「同步云端笔记」重试。"
+        )
+
     if not st.session_state.notes:
-        st.info("还没有笔记。在「研读空间」提问后点击「保存为笔记」即可积累。")
+        st.info("还没有笔记。在「📖 研读空间」提问后点「📌 存笔记」即可；笔记会同步到云端，刷新或换设备后自动恢复。")
     else:
         all_tags   = sorted(set(tag for n in st.session_state.notes for tag in n["tags"]))
         all_topics = sorted(set(n["topic"] for n in st.session_state.notes))
@@ -1703,7 +1883,11 @@ with tab_notes:
             with h2: st.caption(f"🕐 {note['ts']}")
             with h3:
                 if st.button("🗑️", key=f"delnote_{note['id']}"):
-                    st.session_state.notes = [n for n in st.session_state.notes if n["id"] != note["id"]]
+                    # 先删云端，成功后再删本地；失败则保留，避免刷新后又“复活”
+                    if delete_notes_in_cloud([note["id"]]):
+                        st.session_state.notes = [n for n in st.session_state.notes if n["id"] != note["id"]]
+                    else:
+                        st.toast("云端删除失败，笔记已保留，请稍后重试", icon="⚠️")
                     st.rerun()
             if note.get("question"):
                 st.markdown(f"**❓ {note['question']}**")
@@ -1711,4 +1895,8 @@ with tab_notes:
 
         st.markdown("---")
         if st.button("🗑️ 清空所有笔记", type="secondary"):
-            st.session_state.notes = []; st.rerun()
+            if not clear_notes_in_cloud():
+                st.warning("云端清空失败，已停止本地清空以免数据不一致，请稍后重试。")
+            else:
+                st.session_state.notes = []
+            st.rerun()
