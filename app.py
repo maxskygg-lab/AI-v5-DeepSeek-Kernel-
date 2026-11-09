@@ -2,33 +2,33 @@ import streamlit as st
 import pandas as pd
 import os, time, tempfile, re, math, uuid, itertools, io, hashlib
 import arxiv, requests
-import numpy as np # <--- 【修改点 1：新增 numpy 库，用于在内存中进行高效的向量矩阵余弦相似度计算】
-from datetime import datetime, timedelta
+import numpy as np
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from streamlit_agraph import agraph, Node, Edge, Config
 
 # ================= 1. 环境检查与导入 =================
 try:
-    import langchain_community, fitz
-    # --- 修改点：引入 OpenAI 接口适配 DeepSeek 和 HuggingFace 免费向量 ---
+    import langchain_community  # noqa: F401  仅用于启动时的依赖可用性检查
+    import fitz
     from langchain_openai import ChatOpenAI
     from langchain_community.embeddings import HuggingFaceEmbeddings
-    # --- 修改点：引入 Pinecone 云端向量数据库 ---
     from langchain_pinecone import PineconeVectorStore
-    # --- 【混合检索修改点：新增 BM25 和 CrossEncoder 依赖】 ---
-    import rank_bm25
-    import sentence_transformers
+    import rank_bm25  # noqa: F401  仅用于启动时的依赖可用性检查
+    import sentence_transformers  # noqa: F401  仅用于启动时的依赖可用性检查
 except ImportError as e:
-    st.error(f"🚑 环境缺失库 -> {e.name}. 请运行: pip install langchain-openai sentence-transformers pymupdf langchain-pinecone pinecone-client rank_bm25")
+    st.error(
+        f"🚑 环境缺失库 -> {e.name}. 请运行: pip install langchain-openai sentence-transformers pymupdf langchain-pinecone pinecone-client rank_bm25"
+    )
     st.stop()
 
 from langchain_community.document_loaders import PyPDFLoader
-# from langchain_community.vectorstores import FAISS # --- 修改点：移除本地 FAISS 占位 ---
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ================= 2. 页面配置 =================
 st.set_page_config(page_title="AI 深度研读助手", layout="wide", page_icon="🎓")
-st.markdown("""
+st.markdown(
+    """
 <style>
     .stButton>button { width:100%; border-radius:8px; }
     .abstract-box {
@@ -96,9 +96,12 @@ st.markdown("""
         padding:12px 16px; margin:8px 0; font-size:.88em; line-height:1.65;
     }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 st.title("📖 AI 深度研读助手 v5 (DeepSeek Kernel)")
+
 
 # ================= API Key =================
 # 优先读取 Streamlit Secrets，本地运行时回退到系统环境变量
@@ -110,35 +113,34 @@ def _get_secret(name, default=""):
         pass
     return os.getenv(name, default)
 
-# --- 修改点：适配 DeepSeek Key ---
+
 USER_API_KEY = _get_secret("DEEPSEEK_API_KEY")
 SS_API_KEY = _get_secret("SS_API_KEY")
 
-# --- 修改点：新增 Pinecone 配置 ---
 PINECONE_API_KEY = _get_secret("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = _get_secret("PINECONE_INDEX_NAME", "arxiv-papers")
 
 # ================= 3. 状态初始化 =================
 defaults = {
-    "search_results":         [],
-    "search_generator":       None,
-    "citations_loaded":       False,
+    "search_results": [],
+    "search_generator": None,
+    "citations_loaded": False,
     "citations_global_cache": {},
-    "suggested_query":        "",
-    "focus_paper_id":         None,
-    "contributions_cache":    {},
-    "score_cache":            {}, # --- 修改点：新增打分缓存 ---
-    "chat_history":           [],
-    "topics":                 {"default_topic": {"files": [], "chunks": [], "db": None}},
-    "active_topic":           "default_topic",
-    "selected_scope":         "🌐 对比所有论文",
-    "notes":                  [],
-    "pending_note":           None,
-    "notes_synced":           False,   # 本次会话是否已从云端拉取过笔记
-    "notes_unsynced":         [],      # 尚未成功写入云端、待重试的笔记
-    "notes_last_error":       None,
+    "suggested_query": "",
+    "focus_paper_id": None,
+    "contributions_cache": {},
+    "score_cache": {},
+    "chat_history": [],
+    "topics": {"default_topic": {"files": [], "chunks": [], "db": None}},
+    "active_topic": "default_topic",
+    "selected_scope": "🌐 对比所有论文",
+    "notes": [],
+    "pending_note": None,
+    "notes_synced": False,  # 本次会话是否已从云端拉取过笔记
+    "notes_unsynced": [],  # 尚未成功写入云端、待重试的笔记
+    "notes_last_error": None,
     "graph_references_cache": [],
-    "preload_done_ids":       set(),
+    "preload_done_ids": set(),
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -146,36 +148,43 @@ for k, v in defaults.items():
 
 # ================= 4. 工具函数 =================
 
+
 # --- 新增：直接下载 ArXiv PDF，提高效率 ---
 def download_arxiv_pdf_direct(arxiv_id):
     clean_id = get_pure_arxiv_id(arxiv_id)
     pdf_url = f"https://arxiv.org/pdf/{clean_id}.pdf"
     pdf_path = os.path.join(tempfile.gettempdir(), f"{clean_id}.pdf")
     r = requests.get(pdf_url, timeout=15)
-    with open(pdf_path, 'wb') as f:
+    with open(pdf_path, "wb") as f:
         f.write(r.content)
     return pdf_path
+
 
 # --- 新增：DeepSeek 模型获取函数 ---
 def get_deepseek_llm(api_key, temperature=0.1):
     if not api_key:
-        st.error("请先配置 DEEPSEEK_API_KEY"); st.stop()
+        st.error("请先配置 DEEPSEEK_API_KEY")
+        st.stop()
     return ChatOpenAI(
         model="deepseek-chat",
         openai_api_key=api_key,
         openai_api_base="https://api.deepseek.com",
-        temperature=temperature
+        temperature=temperature,
     )
+
 
 # --- 新增：免费 Embeddings 模型获取函数（带缓存） ---
 @st.cache_resource
 def get_embeddings_model():
     return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
+
 @st.cache_resource
 def get_cross_encoder():
     from sentence_transformers import CrossEncoder
-    return CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512)
+
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
+
 
 def get_workspace_id():
     """稳定的工作区标识（跨会话不变），用于 namespace 隔离。
@@ -206,29 +215,40 @@ def get_workspace_id():
     st.session_state["wm_workspace_id"] = wid
     return wid
 
+
 def make_namespace(topic_name):
     return hashlib.sha1(f"{get_workspace_id()}:{topic_name}".encode("utf-8")).hexdigest()
 
+
 @st.cache_resource
 def get_vectorstore(namespace):
-    return PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=get_embeddings_model(), namespace=namespace)
+    return PineconeVectorStore(
+        index_name=PINECONE_INDEX_NAME, embedding=get_embeddings_model(), namespace=namespace
+    )
+
 
 def get_bm25(target_chunks, cache_key):
     if "_bm25_cache" not in st.session_state:
         st.session_state["_bm25_cache"] = {}
     store = st.session_state["_bm25_cache"]
     sig = hashlib.sha1(
-        "|".join([str(len(target_chunks)),
-                  target_chunks[0].page_content[:80] if target_chunks else "",
-                  target_chunks[-1].page_content[-80:] if target_chunks else ""]).encode()
+        "|".join(
+            [
+                str(len(target_chunks)),
+                target_chunks[0].page_content[:80] if target_chunks else "",
+                target_chunks[-1].page_content[-80:] if target_chunks else "",
+            ]
+        ).encode()
     ).hexdigest()
     hit = store.get(cache_key)
     if hit and hit[0] == sig:
         return hit[1]
     from rank_bm25 import BM25Okapi
+
     bm25 = BM25Okapi([list(c.page_content.lower()) for c in target_chunks])
     store[cache_key] = (sig, bm25)
     return bm25
+
 
 def _vector_id(v):
     """不同 pinecone SDK 版本返回的向量对象形状不同，统一取出字符串 id。"""
@@ -238,11 +258,13 @@ def _vector_id(v):
         return v.id
     return str(v)
 
+
 def _ns_vector_count(v):
     """兼容 describe_index_stats().namespaces 的两种返回形状：dict / NamespaceDescription 对象。"""
     if isinstance(v, dict):
         return int(v.get("vector_count", 0) or 0)
     return int(getattr(v, "vector_count", 0) or 0)
+
 
 def _list_namespace_ids(idx, ns):
     """版本兼容地列出 namespace 下全部向量 id（优先新版 list_paginated）。"""
@@ -251,9 +273,11 @@ def _list_namespace_ids(idx, ns):
         # 新版 SDK (>=5.x)：list_paginated 返回分页响应
         token = None
         while True:
-            resp = (idx.list_paginated(namespace=ns, limit=1000)
-                    if token is None
-                    else idx.list_paginated(namespace=ns, limit=1000, pagination_token=token))
+            resp = (
+                idx.list_paginated(namespace=ns, limit=1000)
+                if token is None
+                else idx.list_paginated(namespace=ns, limit=1000, pagination_token=token)
+            )
             vecs = getattr(resp, "vectors", None) or getattr(resp, "ids", None) or []
             for v in vecs:
                 ids.append(_vector_id(v))
@@ -275,6 +299,7 @@ def _list_namespace_ids(idx, ns):
             break
     return ids
 
+
 def restore_topic_from_pinecone(topic_name, verbose=False):
     """从 Pinecone 云端恢复某主题已入库的论文清单与切片，支持重开页面继续研读。"""
     t = st.session_state.topics.get(topic_name)
@@ -285,7 +310,6 @@ def restore_topic_from_pinecone(topic_name, verbose=False):
     ns = make_namespace(topic_name)
     api_key = PINECONE_API_KEY or ""
     try:
-        import json
         from pinecone import Pinecone
         from langchain_core.documents import Document
 
@@ -312,7 +336,7 @@ def restore_topic_from_pinecone(topic_name, verbose=False):
 
         docs, files = [], []
         for start in range(0, len(ids), 500):
-            fetched = idx.fetch(ids=ids[start:start + 500], namespace=ns)
+            fetched = idx.fetch(ids=ids[start : start + 500], namespace=ns)
             vectors = getattr(fetched, "vectors", None) or {}
             for v in vectors.values():
                 md = dict(getattr(v, "metadata", None) or {})
@@ -338,12 +362,14 @@ def restore_topic_from_pinecone(topic_name, verbose=False):
         except Exception:
             pass
 
+
 def migrate_legacy_namespaces(topic_name):
     """把散落在旧 namespace 的向量，按正文去重后搬到当前稳定 namespace（不动旧数据）。"""
     ns = make_namespace(topic_name)
     api_key = PINECONE_API_KEY or ""
     os.environ.setdefault("PINECONE_API_KEY", api_key)
     from pinecone import Pinecone
+
     idx = Pinecone(api_key=api_key).Index(PINECONE_INDEX_NAME)
     stats = idx.describe_index_stats()
     ns_map = getattr(stats, "namespaces", None) or {}
@@ -356,7 +382,7 @@ def migrate_legacy_namespaces(topic_name):
             ids = _list_namespace_ids(idx, s)
             vecs = {}
             for start in range(0, len(ids), 500):
-                fetched = idx.fetch(ids=ids[start:start + 500], namespace=s)
+                fetched = idx.fetch(ids=ids[start : start + 500], namespace=s)
                 vecs.update(getattr(fetched, "vectors", None) or {})
             for _vid, v in vecs.items():
                 md = dict(getattr(v, "metadata", None) or {})
@@ -384,26 +410,31 @@ def migrate_legacy_namespaces(topic_name):
         return 0
     items = list(unique.values())
     for i in range(0, len(items), 100):
-        batch = items[i:i + 100]
+        batch = items[i : i + 100]
         try:
             idx.upsert(vectors=batch, namespace=ns)
         except Exception:
             idx.upsert(vectors=[(b["id"], b["values"], b["metadata"]) for b in batch], namespace=ns)
     return len(items)
 
+
 def active_topic_data():
     return st.session_state.topics[st.session_state.active_topic]
+
 
 # ================= 笔记云端持久化 =================
 def _pinecone_index():
     """统一获取 Pinecone Index 句柄（与主题数据共用同一索引）。"""
     from pinecone import Pinecone
+
     os.environ.setdefault("PINECONE_API_KEY", PINECONE_API_KEY or "")
     return Pinecone(api_key=PINECONE_API_KEY or "").Index(PINECONE_INDEX_NAME)
+
 
 def _notes_namespace():
     """笔记使用独立 namespace：按工作区隔离、跨主题共享（主题记录在笔记自身的 topic 字段）。"""
     return "notes-" + hashlib.sha1(f"{get_workspace_id()}:notes".encode()).hexdigest()[:32]
+
 
 def _retry_cloud(fn, times=3, delay=0.6):
     """网络抖动重试：0.6s → 1.2s 指数退避，缓解瞬时失败。"""
@@ -414,8 +445,9 @@ def _retry_cloud(fn, times=3, delay=0.6):
         except Exception as e:
             last = e
             if i < times - 1:
-                time.sleep(delay * (2 ** i))
+                time.sleep(delay * (2**i))
     raise last
+
 
 def _note_to_metadata(note):
     return {
@@ -427,6 +459,7 @@ def _note_to_metadata(note):
         "topic": note.get("topic") or "",
         "ts": note.get("ts") or "",
     }
+
 
 def _metadata_to_note(md):
     tags = md.get("tags") or []
@@ -440,6 +473,7 @@ def _metadata_to_note(md):
         "topic": md.get("topic") or "",
         "ts": md.get("ts") or "",
     }
+
 
 def save_note_to_cloud(note):
     """把单条笔记写入云端。失败不抛异常，登记到待重试队列，保证内容不丢。"""
@@ -470,6 +504,7 @@ def save_note_to_cloud(note):
             st.session_state.setdefault("notes_unsynced", []).append(note)
         return False
 
+
 def delete_notes_in_cloud(note_ids):
     """按 id 删除云端笔记；失败仅记录，不打断界面操作。"""
     ids = [str(i) for i in note_ids if i]
@@ -484,6 +519,7 @@ def delete_notes_in_cloud(note_ids):
         st.session_state["notes_last_error"] = str(e)
         return False
 
+
 def clear_notes_in_cloud():
     """清空云端笔记 namespace（先列出 id 再批量删除）。"""
     ns = _notes_namespace()
@@ -491,13 +527,14 @@ def clear_notes_in_cloud():
         idx = _pinecone_index()
         ids = _list_namespace_ids(idx, ns)
         for start in range(0, len(ids), 500):
-            batch = ids[start:start + 500]
+            batch = ids[start : start + 500]
             _retry_cloud(lambda: idx.delete(ids=batch, namespace=ns))
         st.session_state["notes_last_error"] = None
         return True
     except Exception as e:
         st.session_state["notes_last_error"] = str(e)
         return False
+
 
 def load_notes_from_cloud():
     """读取云端全部笔记，返回按时间升序的列表。"""
@@ -506,7 +543,7 @@ def load_notes_from_cloud():
     ids = _list_namespace_ids(idx, ns)
     notes = []
     for start in range(0, len(ids), 500):
-        fetched = idx.fetch(ids=ids[start:start + 500], namespace=ns)
+        fetched = idx.fetch(ids=ids[start : start + 500], namespace=ns)
         for v in (getattr(fetched, "vectors", None) or {}).values():
             md = dict(getattr(v, "metadata", None) or {})
             if md.get("type") != "note":
@@ -516,6 +553,7 @@ def load_notes_from_cloud():
                 notes.append(n)
     notes.sort(key=lambda n: n.get("ts") or "")
     return notes
+
 
 def sync_notes_from_cloud():
     """云端 → 本地合并：同 id 以云端为准，本地尚未上传的笔记保留。失败时抛异常由调用方提示。"""
@@ -527,10 +565,12 @@ def sync_notes_from_cloud():
     st.session_state["notes_synced"] = True
     return len(cloud)
 
+
 def retry_unsynced_notes():
     """把上次写入失败的笔记补传云端（网络恢复后自动补漏）。"""
     for n in list(st.session_state.get("notes_unsynced", [])):
         save_note_to_cloud(n)
+
 
 # --- 启动时同步云端笔记（每个会话一次；失败不阻塞应用启动） ---
 if not st.session_state.get("notes_synced"):
@@ -545,65 +585,77 @@ if not st.session_state.get("notes_synced"):
 
 
 def get_pure_arxiv_id(url_or_id):
-    m = re.search(r'(\d{4}\.\d{4,5})', url_or_id)
-    return m.group(1) if m else url_or_id.split('/')[-1].split('v')[0]
+    m = re.search(r"(\d{4}\.\d{4,5})", url_or_id)
+    return m.group(1) if m else url_or_id.split("/")[-1].split("v")[0]
+
 
 def convert_to_excel(results):
     data = []
     for item in results:
-        res = item['obj']
+        res = item["obj"]
         contrib = st.session_state.contributions_cache.get(res.title[:60], "未生成")
-        # --- 修改点 1：在这里读取 session_state 中可能已经打好的分数 ---
         score = st.session_state.score_cache.get(res.title[:60], "未打分")
-        data.append({
-            "标题": res.title,
-            "作者": ", ".join([a.name for a in res.authors]),
-            "年份": res.published.year,
-            "引用数": item.get('citations', 0),
-            "核心贡献 (AI)": contrib,
-            "综合评分 (AI)": score,  # --- 修改点 1：将打分情况塞进 Excel 的行数据里 ---
-            "真实语义相似度": round(item.get('sim_score', 0), 2), # <--- 【修改点 2：在导出的 Excel 中新增“真实语义相似度”列，保留两位小数】
-            "链接": res.entry_id,
-            "摘要": res.summary.replace('\n', ' ')
-        })
-    
+        data.append(
+            {
+                "标题": res.title,
+                "作者": ", ".join([a.name for a in res.authors]),
+                "年份": res.published.year,
+                "引用数": item.get("citations", 0),
+                "核心贡献 (AI)": contrib,
+                "综合评分 (AI)": score,
+                "真实语义相似度": round(item.get("sim_score", 0), 2),
+                "链接": res.entry_id,
+                "摘要": res.summary.replace("\n", " "),
+            }
+        )
+
     df = pd.DataFrame(data)
     output = io.BytesIO()
-    
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='检索结果')
-        workbook  = writer.book
-        worksheet = writer.sheets['检索结果']
-        
-        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#D7E4BC', 'border': 1, 'align': 'center', 'valign': 'vcenter'})
-        cell_fmt   = workbook.add_format({'border': 1, 'valign': 'top', 'text_wrap': True})
-        num_fmt    = workbook.add_format({'border': 1, 'align': 'center', 'valign': 'vcenter'})
-        
-        worksheet.set_column('A:A', 40, cell_fmt)
-        worksheet.set_column('B:B', 20, cell_fmt)
-        worksheet.set_column('C:D', 10, num_fmt)
-        worksheet.set_column('E:E', 50, cell_fmt)
-        # --- 修改点 1：新增第F列留给综合评分，把原来的G列、H列顺延排好防挤压 ---
-        worksheet.set_column('F:F', 30, cell_fmt)
-        worksheet.set_column('G:G', 15, num_fmt) # <--- 【修改点 2：为新增的真实语义相似度列调整列宽和格式】
-        worksheet.set_column('H:H', 30, cell_fmt)
-        worksheet.set_column('I:I', 60, cell_fmt)
-        
+
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="检索结果")
+        workbook = writer.book
+        worksheet = writer.sheets["检索结果"]
+
+        header_fmt = workbook.add_format(
+            {
+                "bold": True,
+                "bg_color": "#D7E4BC",
+                "border": 1,
+                "align": "center",
+                "valign": "vcenter",
+            }
+        )
+        cell_fmt = workbook.add_format({"border": 1, "valign": "top", "text_wrap": True})
+        num_fmt = workbook.add_format({"border": 1, "align": "center", "valign": "vcenter"})
+
+        worksheet.set_column("A:A", 40, cell_fmt)
+        worksheet.set_column("B:B", 20, cell_fmt)
+        worksheet.set_column("C:D", 10, num_fmt)
+        worksheet.set_column("E:E", 50, cell_fmt)
+        worksheet.set_column("F:F", 30, cell_fmt)
+        worksheet.set_column("G:G", 15, num_fmt)
+        worksheet.set_column("H:H", 30, cell_fmt)
+        worksheet.set_column("I:I", 60, cell_fmt)
+
         for col_num, value in enumerate(df.columns.values):
             worksheet.write(0, col_num, value, header_fmt)
-            
+
     return output.getvalue()
+
 
 def auto_batch_contributions(results, api_key, limit=50):
     to_process = results[:limit]
-    pending = [p for p in to_process if p['obj'].title[:60] not in st.session_state.contributions_cache]
-    
+    pending = [
+        p for p in to_process if p["obj"].title[:60] not in st.session_state.contributions_cache
+    ]
+
     if not pending:
         return
-    
+
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = {
-            pool.submit(get_one_line_contribution, p['obj'].summary, p['obj'].title, api_key): p 
+            pool.submit(get_one_line_contribution, p["obj"].summary, p["obj"].title, api_key): p
             for p in pending
         }
         for future in as_completed(futures):
@@ -612,26 +664,30 @@ def auto_batch_contributions(results, api_key, limit=50):
             except:
                 pass
 
+
 @st.cache_data(ttl=1800)
 def fetch_citations_batch_cached(arxiv_ids_tuple: tuple, ss_key=None) -> dict:
     clean_ids = [f"ArXiv:{get_pure_arxiv_id(arxiv_id)}" for arxiv_id in arxiv_ids_tuple]
     url = "https://api.semanticscholar.org/graph/v1/paper/batch"
     headers = {"x-api-key": ss_key} if ss_key else {}
-    try:
-        r = requests.post(url, headers=headers,
-                          params={"fields": "citationCount,externalIds"},
-                          json={"ids": clean_ids}, timeout=15)
-        if r.status_code == 200:
-            out = {}
-            for item in r.json():
-                if item and item.get("externalIds"):
-                    aid = item["externalIds"].get("ArXiv","")
-                    if aid:
-                        out[aid] = item.get("citationCount", 0)
-            return out
-    except Exception as e:
-        st.warning(f"批量引用数获取异常，降级: {e}")
-    return {}
+    r = requests.post(
+        url,
+        headers=headers,
+        params={"fields": "citationCount,externalIds"},
+        json={"ids": clean_ids},
+        timeout=15,
+    )
+    # 失败时抛异常，避免把空结果缓存 30 分钟（否则看起来像“功能失效”）
+    if r.status_code != 200:
+        raise RuntimeError(f"Semantic Scholar 返回 HTTP {r.status_code}")
+    out = {}
+    for item in r.json():
+        if item and item.get("externalIds"):
+            aid = item["externalIds"].get("ArXiv", "")
+            if aid:
+                out[aid] = item.get("citationCount", 0)
+    return out
+
 
 def fetch_one_citation(args):
     arxiv_id, ss_key = args
@@ -640,12 +696,14 @@ def fetch_one_citation(args):
         headers = {"x-api-key": ss_key} if ss_key else {}
         r = requests.get(url, headers=headers, timeout=6)
         if r.status_code == 200:
-            return arxiv_id, r.json().get('citationCount', 0)
-    except: pass
+            return arxiv_id, r.json().get("citationCount", 0)
+    except Exception:
+        pass
     return arxiv_id, 0
 
+
 def fetch_citations_parallel(results, ss_key=None):
-    args_list = [(item['obj'].entry_id, ss_key) for item in results]
+    args_list = [(item["obj"].entry_id, ss_key) for item in results]
     out = {}
     with ThreadPoolExecutor(max_workers=8 if ss_key else 3) as pool:
         for future in as_completed({pool.submit(fetch_one_citation, a): a[0] for a in args_list}):
@@ -653,37 +711,52 @@ def fetch_citations_parallel(results, ss_key=None):
             out[aid] = count
     return out
 
+
 def smart_fetch_citations(results, ss_key=None):
     cache = st.session_state.citations_global_cache
-    missing = [item for item in results if get_pure_arxiv_id(item['obj'].entry_id) not in cache]
+    missing = [item for item in results if get_pure_arxiv_id(item["obj"].entry_id) not in cache]
     hits = len(results) - len(missing)
     if hits:
         st.caption(f"⚡ {hits} 篇命中缓存，{len(missing)} 篇需请求")
     if missing:
-        ids = tuple(item['obj'].entry_id for item in missing)
-        new_data = fetch_citations_batch_cached(ids, ss_key)
+        ids = tuple(item["obj"].entry_id for item in missing)
+        try:
+            new_data = fetch_citations_batch_cached(ids, ss_key)
+        except Exception as e:
+            st.session_state["ss_last_error"] = str(e)
+            new_data = {}
         if not new_data:
-            new_data = {get_pure_arxiv_id(k): v
-                        for k, v in fetch_citations_parallel(missing, ss_key).items()}
+            new_data = {
+                get_pure_arxiv_id(k): v
+                for k, v in fetch_citations_parallel(missing, ss_key).items()
+            }
         cache.update(new_data)
-    return {item['obj'].entry_id: cache.get(get_pure_arxiv_id(item['obj'].entry_id), 0)
-            for item in results}
+    return {
+        item["obj"].entry_id: cache.get(get_pure_arxiv_id(item["obj"].entry_id), 0)
+        for item in results
+    }
+
 
 def preload_top_graphs(results, ss_key=None, top_n=3):
     done = st.session_state.preload_done_ids
-    to_do = [item for item in sorted(results, key=lambda x: x.get("citations") or 0, reverse=True)[:top_n]
-             if item['obj'].entry_id not in done]
-    if not to_do: return
+    to_do = [
+        item
+        for item in sorted(results, key=lambda x: x.get("citations") or 0, reverse=True)[:top_n]
+        if item["obj"].entry_id not in done
+    ]
+    if not to_do:
+        return
     ph = st.empty()
     ph.caption(f"🔄 后台预加载 Top {len(to_do)} 图谱…")
     for item in to_do:
-        fetch_graph_data(item['obj'].entry_id, ss_key=ss_key)
-        done.add(item['obj'].entry_id)
+        fetch_graph_data(item["obj"].entry_id, ss_key=ss_key)
+        done.add(item["obj"].entry_id)
         time.sleep(0.3)
     ph.caption("✅ 图谱预加载完成")
 
-@st.cache_data(ttl=3600)
+
 def fetch_graph_data(arxiv_id, ss_key=None):
+    """外层不加 cache：只有成功载荷会被 _fetch_graph_payload 缓存，失败不会被缓存。"""
     clean_id = get_pure_arxiv_id(arxiv_id)
     fields = (
         "paperId,title,year,citationCount,abstract,"
@@ -693,49 +766,64 @@ def fetch_graph_data(arxiv_id, ss_key=None):
         "citations.year,citations.abstract,citations.externalIds"
     )
     url = f"https://api.semanticscholar.org/graph/v1/paper/ArXiv:{clean_id}?fields={fields}"
-    headers = {"x-api-key": ss_key} if ss_key else {}
+    last_err = None
     for attempt in range(3):
         try:
-            r = requests.get(url, headers=headers, timeout=12)
-            if r.status_code == 200: return r.json()
-            elif r.status_code == 429: time.sleep((attempt+1)*2)
-        except:
-            if attempt == 2: return None
+            return _fetch_graph_payload(url, ss_key or "")
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep((attempt + 1) * 1.5)
+    st.session_state["ss_last_error"] = str(last_err)
     return None
 
-# --- 修改点：新增依据标题获取 SS 详细元数据的函数（用于增强问答） ---
-@st.cache_data(ttl=3600)
-def fetch_ss_paper_details_by_title(title, ss_key=None):
-    clean_title = title.replace(".pdf", "").strip()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_graph_payload(url: str, ss_key: str):
+    """只在成功时缓存；失败抛异常，避免把“取不到”缓存一小时。"""
+    headers = {"x-api-key": ss_key} if ss_key else {}
+    r = requests.get(url, headers=headers, timeout=12)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    return r.json()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _search_ss_paper(clean_title: str, ss_key: str):
+    """只在成功时缓存；失败抛异常，避免“查不到”被缓存一小时。"""
     url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={clean_title}&limit=1&fields=title,year,authors,citationCount,influentialCitationCount,tldr,venue"
     headers = {"x-api-key": ss_key} if ss_key else {}
+    r = requests.get(url, headers=headers, timeout=5)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    data = r.json().get("data", [])
+    return data[0] if data else None
+
+
+def fetch_ss_paper_details_by_title(title, ss_key=None):
     try:
-        r = requests.get(url, headers=headers, timeout=5)
-        if r.status_code == 200:
-            data = r.json().get("data", [])
-            if data:
-                return data[0]
-    except: pass
-    return None
+        return _search_ss_paper(title.replace(".pdf", "").strip(), ss_key or "")
+    except Exception:
+        return None
+
 
 def get_one_line_contribution(abstract, title, api_key):
     key = title[:60]
     if key in st.session_state.contributions_cache:
         return st.session_state.contributions_cache[key]
     try:
-        # --- 修改点：调用 DeepSeek ---
         llm = get_deepseek_llm(api_key, temperature=0.0)
         res = llm.invoke(
             f"请用一句话（不超过40个汉字或20个英文单词）总结这篇论文的核心创新贡献。"
             f"只输出这一句话，不要前缀或解释。\n\n标题：{title}\n摘要：{abstract[:600]}"
         )
         result = res.content.strip()
-    except Exception as e: 
+    except Exception:
         result = "（生成失败）"
     st.session_state.contributions_cache[key] = result
     return result
 
-# --- 修改点：新增依据 SS 真实数据的单篇论文打分函数 ---
+
 def get_paper_score(arxiv_id, title, abstract, api_key, ss_key):
     # 此处已移除对 st.session_state 的直接读写，变为纯函数，防止多线程崩溃
     try:
@@ -752,11 +840,11 @@ def get_paper_score(arxiv_id, title, abstract, api_key, ss_key):
                 inf_cites = data.get("influentialCitationCount", 0)
                 pub_year = data.get("year", "未知年份")
                 ss_info = f"\n\n【Semantic Scholar 真实辅助数据】\n- 发表年份: {pub_year}\n- 极具影响力引用数: {inf_cites}\n- 官方TLDR摘要: {tldr}"
-        except: pass
+        except:
+            pass
 
         # 锁定 temperature 为 0.0，杜绝大模型随机性，严格执行量表
         llm = get_deepseek_llm(api_key, temperature=0.0)
-        # --- 修改点：优化打分 prompt，缓和极端低分，提高区分度以解决分数雷同问题 ---
         prompt = (
             f"你现在是一位顶尖人工智能领域的资深论文导师。请你结合给定信息，客观且富有区分度地对这篇论文进行综合打分（满分100分）。\n"
             f"当前的打分常常偏低且雷同，请仔细发掘论文的细节和创新点，充分利用整个分数段（不要刻意压低分数），拉开合理的差距。\n\n"
@@ -779,26 +867,32 @@ def get_paper_score(arxiv_id, title, abstract, api_key, ss_key):
         )
         res = llm.invoke(prompt)
         result = res.content.strip()
-    except Exception as e:
+    except Exception:
         result = "（打分失败）"
     return result
 
+
 def fix_latex(text):
-    if not text: return text
-    return text.replace(r"\(","$").replace(r"\)","$").replace(r"\[","$$").replace(r"\]","$$")
+    if not text:
+        return text
+    return text.replace(r"\(", "$").replace(r"\)", "$").replace(r"\[", "$$").replace(r"\]", "$$")
+
 
 def _extract_text_with_fitz(file_path, file_name, topic_name):
     """PyPDF 提取不到文字时回退到 PyMuPDF，兼容扫描版/特殊编码 PDF。"""
     from langchain_core.documents import Document
+
     docs = []
     with fitz.open(file_path) as pdf:
         for i, page in enumerate(pdf):
             txt = page.get_text()
             if txt and txt.strip():
-                docs.append(Document(
-                    page_content=txt,
-                    metadata={"source_paper": file_name, "topic": topic_name, "page": i},
-                ))
+                docs.append(
+                    Document(
+                        page_content=txt,
+                        metadata={"source_paper": file_name, "topic": topic_name, "page": i},
+                    )
+                )
     return docs
 
 
@@ -809,173 +903,223 @@ def process_and_add_to_topic(file_path, file_name, api_key, topic_name=None):
         loader = PyPDFLoader(file_path)
         docs = loader.load()
         for doc in docs:
-            doc.metadata['source_paper'] = file_name
-            doc.metadata['topic'] = topic_name
+            doc.metadata["source_paper"] = file_name
+            doc.metadata["topic"] = topic_name
         # 若 pypdf 未能提取文字（如扫描版 PDF），回退到 PyMuPDF
         if not docs or not any(d.page_content.strip() for d in docs):
             docs = _extract_text_with_fitz(file_path, file_name, topic_name)
 
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=600, chunk_overlap=200,
-            separators=["\n\n","\n","。","."," ",""]
+            chunk_size=600, chunk_overlap=200, separators=["\n\n", "\n", "。", ".", " ", ""]
         )
         chunks = [c for c in splitter.split_documents(docs) if len(c.page_content.strip()) > 20]
 
         if not chunks:
-            st.error(f"🚫 《{file_name}》未能提取到任何文字（可能是扫描版 PDF 或文件已损坏），已跳过入库，未加入可检索内容。")
+            st.error(
+                f"🚫 《{file_name}》未能提取到任何文字（可能是扫描版 PDF 或文件已损坏），已跳过入库，未加入可检索内容。"
+            )
             return False
         t["chunks"].extend(chunks)
-        
-        # --- 修改点：使用 HuggingFace 免费向量 ---
-        embeddings = get_embeddings_model()
-        
+
         batch = 10
-        # --- 修改点：连接并写入 Pinecone 云数据库 ---
         if not PINECONE_API_KEY:
-            st.error("🚑 请先在 Streamlit Secrets 中配置 PINECONE_API_KEY"); return False
+            st.error("🚑 请先在 Streamlit Secrets 中配置 PINECONE_API_KEY")
+            return False
         os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
-        
+
         if t["db"] is None:
             # 初始化连接云端索引，按主题划分 namespace（转码为 ASCII 兼容格式）
             safe_namespace = make_namespace(topic_name)
             t["db"] = get_vectorstore(safe_namespace)
-            
+
         # 直接向 Pinecone 批量添加文档向量
         for i in range(0, len(chunks), batch):
-            t["db"].add_documents(chunks[i:i+batch]); time.sleep(0.1)
-            
+            t["db"].add_documents(chunks[i : i + batch])
+            time.sleep(0.1)
+
         if file_name not in t["files"]:
             t["files"].append(file_name)
-        st.session_state.chat_history.append({
-            "role": "system_notice",
-            "content": f"📚 《{file_name}》已加入主题「{topic_name}」。"
-        })
+        st.session_state.chat_history.append(
+            {"role": "system_notice", "content": f"📚 《{file_name}》已加入主题「{topic_name}」。"}
+        )
         return True
     except Exception as e:
-        st.error(f"处理失败: {e}"); return False
+        st.error(f"处理失败: {e}")
+        return False
+
 
 def rebuild_topic_index(topic_name, api_key):
     t = st.session_state.topics[topic_name]
-    if not t["chunks"]: t["db"] = None; return
-    
-    # --- 修改点：使用 HuggingFace 免费向量 ---
-    embeddings = get_embeddings_model()
-    # --- 修改点：重建索引时重新连接 Pinecone ---
+    if not t["chunks"]:
+        t["db"] = None
+        return
+
     import os
+
     if PINECONE_API_KEY:
         os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
     safe_namespace = make_namespace(topic_name)
     t["db"] = get_vectorstore(safe_namespace)
 
+
 def detect_knowledge_gap(answer_text, docs):
-    sigs = ["资料不足","没有找到","无法回答","未提及","不清楚","没有相关","cannot find","not mentioned"]
-    if len(docs) < 3: return True
+    sigs = [
+        "资料不足",
+        "没有找到",
+        "无法回答",
+        "未提及",
+        "不清楚",
+        "没有相关",
+        "cannot find",
+        "not mentioned",
+    ]
+    if len(docs) < 3:
+        return True
     for s in sigs:
-        if s.lower() in answer_text.lower(): return True
+        if s.lower() in answer_text.lower():
+            return True
     return False
+
 
 def get_gap_recommendations():
     loaded = set()
-    for t in st.session_state.topics.values(): loaded.update(t["files"])
-    return [r for r in st.session_state.graph_references_cache
-            if not any(r.get("title","")[:20].lower() in f.lower() for f in loaded)][:4]
+    for t in st.session_state.topics.values():
+        loaded.update(t["files"])
+    return [
+        r
+        for r in st.session_state.graph_references_cache
+        if not any(r.get("title", "")[:20].lower() in f.lower() for f in loaded)
+    ][:4]
 
 
 # ================= 5. 图谱渲染 =================
 def render_connected_graph(data, min_cite_filter=0):
-    if not data: return None, {}
+    if not data:
+        return None, {}
     nodes, edges, details = [], [], {}
     cur_year = 2026
 
     def color(year, rel):
-        if not year or year == 'Unknown': return "#94a3b8"
+        if not year or year == "Unknown":
+            return "#94a3b8"
         age = max(0, cur_year - int(year))
-        if rel == 'seed': return "#FF4B4B"
-        if rel == 'cite': return "#059669" if age<2 else "#10b981" if age<5 else "#6ee7b7"
-        return "#2563eb" if age<2 else "#3b82f6" if age<5 else "#93c5fd"
+        if rel == "seed":
+            return "#FF4B4B"
+        if rel == "cite":
+            return "#059669" if age < 2 else "#10b981" if age < 5 else "#6ee7b7"
+        return "#2563eb" if age < 2 else "#3b82f6" if age < 5 else "#93c5fd"
 
-    seed = data.get('paperId','root')
+    seed = data.get("paperId", "root")
     details[seed] = {
-        "title":    data.get('title','Seed Paper'),
-        "abstract": data.get('abstract') or "无摘要",
-        "year":     data.get('year','Unknown'),
-        "cites":    data.get('citationCount',0),
-        "url":      f"https://www.semanticscholar.org/paper/{seed}",
+        "title": data.get("title", "Seed Paper"),
+        "abstract": data.get("abstract") or "无摘要",
+        "year": data.get("year", "Unknown"),
+        "cites": data.get("citationCount", 0),
+        "url": f"https://www.semanticscholar.org/paper/{seed}",
         "arxiv_id": None,
     }
-    nodes.append(Node(id=seed, label="THIS PAPER", size=35, color=color(data.get('year'),'seed')))
+    nodes.append(Node(id=seed, label="THIS PAPER", size=35, color=color(data.get("year"), "seed")))
     seen = {seed}
     refs_for_gap = []
 
     combined = []
-    for p in data.get('references',[])[:20]: p['rel_type']='ref'; combined.append(p)
-    for p in data.get('citations',[])[:20]:  p['rel_type']='cite'; combined.append(p)
+    for p in data.get("references", [])[:20]:
+        p["rel_type"] = "ref"
+        combined.append(p)
+    for p in data.get("citations", [])[:20]:
+        p["rel_type"] = "cite"
+        combined.append(p)
 
     for item in combined:
-        pid   = item.get('paperId')
-        cites = item.get('citationCount',0) or 0
-        if not pid or pid in seen or cites < min_cite_filter: continue
+        pid = item.get("paperId")
+        cites = item.get("citationCount", 0) or 0
+        if not pid or pid in seen or cites < min_cite_filter:
+            continue
         seen.add(pid)
-        title    = item.get('title','Unknown')
-        year     = item.get('year')
-        ext      = item.get('externalIds') or {}
-        arxiv_id = ext.get('ArXiv')
+        title = item.get("title", "Unknown")
+        year = item.get("year")
+        ext = item.get("externalIds") or {}
+        arxiv_id = ext.get("ArXiv")
         details[pid] = {
-            "title":    title,
-            "abstract": item.get('abstract') or "暂无摘要",
-            "year":     year, "cites": cites,
-            "url":      f"https://www.semanticscholar.org/paper/{pid}",
+            "title": title,
+            "abstract": item.get("abstract") or "暂无摘要",
+            "year": year,
+            "cites": cites,
+            "url": f"https://www.semanticscholar.org/paper/{pid}",
             "arxiv_id": arxiv_id,
         }
-        if item['rel_type']=='ref' and arxiv_id:
-            refs_for_gap.append({"title":title,"arxiv_id":arxiv_id,"abstract":item.get('abstract','')})
-        sz = 15 + math.log(cites+1)*3.5
-        nodes.append(Node(id=pid, label=f"{title[:20]}…", size=sz, color=color(year, item['rel_type'])))
-        if item['rel_type']=='cite':
+        if item["rel_type"] == "ref" and arxiv_id:
+            refs_for_gap.append(
+                {"title": title, "arxiv_id": arxiv_id, "abstract": item.get("abstract", "")}
+            )
+        sz = 15 + math.log(cites + 1) * 3.5
+        nodes.append(
+            Node(id=pid, label=f"{title[:20]}…", size=sz, color=color(year, item["rel_type"]))
+        )
+        if item["rel_type"] == "cite":
             edges.append(Edge(source=pid, target=seed, color="#d1d5db", width=1, dashed=True))
         else:
             edges.append(Edge(source=seed, target=pid, color="#94a3b8", width=1.5))
 
     st.session_state.graph_references_cache = refs_for_gap
-    cfg = Config(width="100%", height=560, directed=True, physics=True,
-                 nodeHighlightBehavior=True, highlightColor="#F7D154",
-                 d3={'alphaTarget':0.05,'gravity':-250,'linkLength':150,'linkStrength':0.1})
+    cfg = Config(
+        width="100%",
+        height=560,
+        directed=True,
+        physics=True,
+        nodeHighlightBehavior=True,
+        highlightColor="#F7D154",
+        d3={"alphaTarget": 0.05, "gravity": -250, "linkLength": 150, "linkStrength": 0.1},
+    )
     clicked = agraph(nodes=nodes, edges=edges, config=cfg)
     return clicked, details
+
 
 # ================= 6. 侧边栏 =================
 with st.sidebar:
     st.header("🎛️ 控制台")
     user_api_key = USER_API_KEY
-    ss_api_key   = SS_API_KEY
+    ss_api_key = SS_API_KEY
     st.success("🚀 高速调研模式已激活")
+    if ss_api_key:
+        st.caption("✅ Semantic Scholar 已配置（引用数 / 关联图谱可用）")
+    else:
+        st.caption("⚠️ 未配置 SS_API_KEY：引用数与关联图谱易受限流影响")
 
     cache_sz = len(st.session_state.citations_global_cache)
-    if cache_sz: st.info(f"⚡ 引用数缓存：{cache_sz} 篇")
+    if cache_sz:
+        st.info(f"⚡ 引用数缓存：{cache_sz} 篇")
 
     st.markdown("---")
     st.subheader("🗂️ 研究主题")
     tnames = list(st.session_state.topics.keys())
-    aidx   = tnames.index(st.session_state.active_topic) if st.session_state.active_topic in tnames else 0
+    aidx = (
+        tnames.index(st.session_state.active_topic)
+        if st.session_state.active_topic in tnames
+        else 0
+    )
     chosen = st.selectbox("当前主题", tnames, index=aidx)
     if chosen != st.session_state.active_topic:
         st.session_state.active_topic = chosen
         st.session_state.selected_scope = "🌐 对比所有论文"
         st.rerun()
 
-    cn, ca = st.columns([3,1])
-    with cn: new_tn = st.text_input("新建主题", placeholder="输入名称", label_visibility="collapsed")
+    cn, ca = st.columns([3, 1])
+    with cn:
+        new_tn = st.text_input("新建主题", placeholder="输入名称", label_visibility="collapsed")
     with ca:
         if st.button("➕") and new_tn.strip():
             nm = new_tn.strip()
             if nm not in st.session_state.topics:
-                st.session_state.topics[nm] = {"files":[],"chunks":[],"db":None}
-                st.session_state.active_topic = nm; st.rerun()
+                st.session_state.topics[nm] = {"files": [], "chunks": [], "db": None}
+                st.session_state.active_topic = nm
+                st.rerun()
 
     if len(st.session_state.topics) > 1:
         if st.button(f"🗑️ 删除「{st.session_state.active_topic}」"):
             del st.session_state.topics[st.session_state.active_topic]
-            st.session_state.active_topic = list(st.session_state.topics.keys())[0]; st.rerun()
+            st.session_state.active_topic = list(st.session_state.topics.keys())[0]
+            st.rerun()
 
     ts = active_topic_data()
     # 启动时从云端自动恢复一次本主题的已入库论文（重开页面可继续研读）
@@ -990,7 +1134,10 @@ with st.sidebar:
             with st.spinner("恢复中..."):
                 restore_topic_from_pinecone(st.session_state.active_topic, verbose=True)
             st.rerun()
-        if st.button("🛠 迁移旧数据到当前主题", help="把散落在旧 namespace 的论文去重后搬入本主题（一次性维护）"):
+        if st.button(
+            "🛠 迁移旧数据到当前主题",
+            help="把散落在旧 namespace 的论文去重后搬入本主题（一次性维护）",
+        ):
             with st.spinner("正在迁移旧 namespace 数据..."):
                 _n = migrate_legacy_namespaces(st.session_state.active_topic)
             if _n:
@@ -1001,27 +1148,30 @@ with st.sidebar:
     if ts["files"]:
         st.markdown(f"**已入库（{len(ts['files'])}篇）**")
         for f in list(ts["files"]):
-            c1,c2 = st.columns([4,1])
-            with c1: st.text(f"📄 {f[:16]}..." if len(f)>18 else f"📄 {f}")
+            c1, c2 = st.columns([4, 1])
+            with c1:
+                st.text(f"📄 {f[:16]}..." if len(f) > 18 else f"📄 {f}")
             with c2:
                 if st.button("🗑️", key=f"del_{f}"):
                     ts["files"].remove(f)
-                    ts["chunks"] = [c for c in ts["chunks"] if c.metadata.get('source_paper')!=f]
-                    # --- 修改点：同步删除 Pinecone 云端该论文的向量数据 ---
+                    ts["chunks"] = [c for c in ts["chunks"] if c.metadata.get("source_paper") != f]
                     if ts["db"]:
                         try:
                             ts["db"].delete(filter={"source_paper": f})
-                        except Exception: pass
-                    rebuild_topic_index(st.session_state.active_topic, user_api_key); st.rerun()
+                        except Exception:
+                            pass
+                    rebuild_topic_index(st.session_state.active_topic, user_api_key)
+                    st.rerun()
         if st.button("🗑️ 清空主题", type="primary"):
-            # --- 修改点：连带清空 Pinecone 该主题的 namespace ---
             if ts["db"]:
                 try:
                     safe_namespace = make_namespace(st.session_state.active_topic)
                     ts["db"].delete(delete_all=True, namespace=safe_namespace)
-                except Exception: pass
-            ts["files"],ts["chunks"],ts["db"] = [],[],None
-            st.session_state.chat_history = []; st.rerun()
+                except Exception:
+                    pass
+            ts["files"], ts["chunks"], ts["db"] = [], [], None
+            st.session_state.chat_history = []
+            st.rerun()
 
     st.markdown("---")
     st.subheader("📥 上传 PDF")
@@ -1029,31 +1179,37 @@ with st.sidebar:
     if uploaded_file and st.button("确认加载"):
         with st.spinner("解析中..."):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(uploaded_file.getvalue()); path = tmp.name
+                tmp.write(uploaded_file.getvalue())
+                path = tmp.name
             process_and_add_to_topic(path, uploaded_file.name, user_api_key)
-            os.remove(path); st.rerun()
+            os.remove(path)
+            st.rerun()
 
 # ================= 7. 主界面 =================
 
-tab_main, tab_read, tab_notes = st.tabs([
-    "🔍 学术检索 & 图谱", "📖 研读空间", "📌 我的笔记"
-])
+tab_main, tab_read, tab_notes = st.tabs(["🔍 学术检索 & 图谱", "📖 研读空间", "📌 我的笔记"])
 
 # ══════════════════════════════════════════
 # Tab 1：学术检索 & 图谱
 # ══════════════════════════════════════════
 with tab_main:
     st.markdown('<div class="section-divider">🌍 学术检索</div>', unsafe_allow_html=True)
-    
-    # --- 修改点：恢复两列布局，去掉独立的下拉框 ---
-    sq1,sq2 = st.columns([4,2])
-    with sq1:
-        search_query = st.text_input("关键词", value=st.session_state.suggested_query,
-                                     placeholder="输入关键词，例如: education robot", label_visibility="collapsed")
-    with sq2:
-        sort_mode = st.selectbox("排序",["🔥 相关性", "🌟 综合(相关+质量)", "💎 质量优先", "📅 最新", "📈 引用量"], label_visibility="collapsed")
 
-    # --- 修改点开始：将固定下拉框改为动态任意比例滑块，并与左侧模式深度绑定 ---
+    sq1, sq2 = st.columns([4, 2])
+    with sq1:
+        search_query = st.text_input(
+            "关键词",
+            value=st.session_state.suggested_query,
+            placeholder="输入关键词，例如: education robot",
+            label_visibility="collapsed",
+        )
+    with sq2:
+        sort_mode = st.selectbox(
+            "排序",
+            ["🔥 相关性", "🌟 综合(相关+质量)", "💎 质量优先", "📅 最新", "📈 引用量"],
+            label_visibility="collapsed",
+        )
+
     rel_w = 1.0
     qual_w = 0.0
     if sort_mode in ["🌟 综合(相关+质量)", "💎 质量优先"]:
@@ -1061,13 +1217,17 @@ with tab_main:
         default_rel = 60 if "综合" in sort_mode else 20
         rel_weight_pct = st.slider(
             "⚖️ 自定义权重配比 (任意调节，左拉看重质量，右拉看重相关性)",
-            min_value=0, max_value=100, value=default_rel, step=1,
-            format="相关性 %d%%"
+            min_value=0,
+            max_value=100,
+            value=default_rel,
+            step=1,
+            format="相关性 %d%%",
         )
         rel_w = rel_weight_pct / 100.0
         qual_w = 1.0 - rel_w
-        st.caption(f"💡 当前计算规则：总分 = (真实语义分 × **{rel_w:.2f}**) + (AI质量分 × **{qual_w:.2f}**)") # <--- 【修改点 3：更新提示文案】
-    # --- 修改点结束 ---
+        st.caption(
+            f"💡 当前计算规则：总分 = (真实语义分 × **{rel_w:.2f}**) + (AI质量分 × **{qual_w:.2f}**)"
+        )
 
     with st.expander("⚙️ 高级筛选 (学科/期刊)"):
         adv1, adv2 = st.columns(2)
@@ -1081,23 +1241,25 @@ with tab_main:
                 "电气工程与系统科学 (EESS)": "eess.*",
                 "定量生物学 (Quantitative Biology)": "q-bio.*",
                 "定量金融 (Quantitative Finance)": "q-fin.*",
-                "经济学 (Economics)": "econ.*"
+                "经济学 (Economics)": "econ.*",
             }
             selected_category = st.selectbox("学科分类过滤", list(category_options.keys()))
         with adv2:
-            journal_query = st.text_input("期刊/杂志/会议名称 (选填)", placeholder="例如: Nature, IEEE,ACM,CVPR,NIPS")
+            journal_query = st.text_input(
+                "期刊/杂志/会议名称 (选填)", placeholder="例如: Nature, IEEE,ACM,CVPR,NIPS"
+            )
 
     if st.button("🚀 检索", use_container_width=True) and search_query:
         with st.spinner("正在向 ArXiv 请求数据..."):
             try:
                 asort = arxiv.SortCriterion.Relevance
-                if "最新" in sort_mode: asort = arxiv.SortCriterion.SubmittedDate
-                
-                # --- 修改点：放宽检索条件，最大化召回率，不放过相关论文 ---
+                if "最新" in sort_mode:
+                    asort = arxiv.SortCriterion.SubmittedDate
+
                 refined = search_query
                 if " " in search_query and "AND" not in search_query and '"' not in search_query:
                     # 取消了双引号的强制短语匹配，改用 all 字段的 AND 组合，只要论文里包含这些词就统统找出来
-                    refined = " AND ".join([f'all:{w}' for w in search_query.split()])
+                    refined = " AND ".join([f"all:{w}" for w in search_query.split()])
                 else:
                     refined = f"({refined})"
 
@@ -1107,7 +1269,7 @@ with tab_main:
                 if journal_query.strip():
                     val = journal_query.strip()
                     refined += f' AND (jr:"{val}" OR co:"{val}")'
-                
+
                 # --- 新增辅助提示：在界面上显示真实发送给接口的查询语句 ---
                 st.caption(f"🔍 检索指令预览: `{refined}`")
 
@@ -1116,25 +1278,27 @@ with tab_main:
                 raw = []
                 for attempt in range(max_retries):
                     try:
-                        # --- 修改点：增加 max_results=2000，让 ArXiv 把底库翻个底朝天 ---
-                        raw_gen = arxiv.Client().results(arxiv.Search(query=refined, max_results=2000, sort_by=asort))
+                        raw_gen = arxiv.Client().results(
+                            arxiv.Search(query=refined, max_results=2000, sort_by=asort)
+                        )
                         st.session_state.search_generator = raw_gen
-                        # --- 修改点：初次加载数量从 50 提升到 100，避免单次太多导致 API 崩溃 ---
                         raw = list(itertools.islice(raw_gen, 100))
-                        break 
+                        break
                     except Exception as e:
                         if "429" in str(e) and attempt < max_retries - 1:
                             time.sleep(3)
                             continue
-                        else: raise e
-                
+                        else:
+                            raise e
+
                 # --- 新增辅助提示：针对零结果给出清晰引导 ---
                 if not raw:
-                    st.warning("⚠️ 未找到匹配论文。建议：1. 缩减关键词 2. 清空‘期刊名称’筛选框 3. 检查学科分类是否选错。")
-                
-                st.session_state.search_results = [{"obj":r,"citations":None} for r in raw]
-                
-                # <--- 【修改点 4：在此处批量计算这 100 篇论文与关键词的真实语义余弦相似度】 --->
+                    st.warning(
+                        "⚠️ 未找到匹配论文。建议：1. 缩减关键词 2. 清空‘期刊名称’筛选框 3. 检查学科分类是否选错。"
+                    )
+
+                st.session_state.search_results = [{"obj": r, "citations": None} for r in raw]
+
                 if st.session_state.search_results:
                     with st.spinner("正在利用本地向量模型进行底层语义匹配打分..."):
                         try:
@@ -1142,7 +1306,9 @@ with tab_main:
                             # 1. 向量化用户搜索词
                             query_vec = np.array(embeddings_model.embed_query(search_query))
                             # 2. 批量提取摘要并向量化
-                            abstracts = [item['obj'].summary for item in st.session_state.search_results]
+                            abstracts = [
+                                item["obj"].summary for item in st.session_state.search_results
+                            ]
                             doc_vecs = np.array(embeddings_model.embed_documents(abstracts))
                             # 3. 计算余弦相似度公式: (A·B) / (||A|| * ||B||)
                             norms_doc = np.linalg.norm(doc_vecs, axis=1)
@@ -1150,59 +1316,63 @@ with tab_main:
                             similarities = np.dot(doc_vecs, query_vec) / (norms_doc * norm_query)
                             # 4. 将真实分数转为百分制并写回字典
                             for idx, item in enumerate(st.session_state.search_results):
-                                item['sim_score'] = float(similarities[idx]) * 100 
+                                item["sim_score"] = float(similarities[idx]) * 100
                         except Exception as e:
                             st.warning(f"本地语义计算异常，将降级使用基础分: {e}")
                             for item in st.session_state.search_results:
-                                item['sim_score'] = 50.0 # 失败兜底分
-                # <--- 【修改点 4 结束】 --->
+                                item["sim_score"] = 50.0  # 失败兜底分
 
                 st.session_state.citations_loaded = False
                 st.session_state.contributions_cache = {}
                 st.session_state.focus_paper_id = None
-            except Exception as e: st.error(f"检索失败: {e}")
+            except Exception as e:
+                st.error(f"检索失败: {e}")
 
         if st.session_state.search_results:
             t0 = time.time()
             with st.spinner("同步引用数..."):
                 id2c = smart_fetch_citations(st.session_state.search_results, ss_key=ss_api_key)
                 for item in st.session_state.search_results:
-                    item["citations"] = id2c.get(item['obj'].entry_id, 0)
-                
+                    item["citations"] = id2c.get(item["obj"].entry_id, 0)
+
                 if "引用量" in sort_mode:
-                    st.session_state.search_results.sort(key=lambda x: x["citations"] or 0, reverse=True)
+                    st.session_state.search_results.sort(
+                        key=lambda x: x["citations"] or 0, reverse=True
+                    )
                 elif "质量优先" in sort_mode or "综合" in sort_mode:
-                    import math
                     current_year = datetime.now().year
                     for idx, item in enumerate(st.session_state.search_results):
-                        # <--- 【修改点 5：废弃伪相关性硬编码（if idx < 10 等），直接读取真实向量匹配分】 --->
-                        rel_score = item.get('sim_score', 50.0)
-                        
+                        rel_score = item.get("sim_score", 50.0)
+
                         cites = item["citations"] or 0
                         cite_score = (math.log10(cites + 1) / 3.0) * 100
-                        
-                        pub_year = item['obj'].published.year
+
+                        pub_year = item["obj"].published.year
                         age = max(0, current_year - pub_year)
-                        
+
                         # 针对不同模式计算时效补偿
                         if "质量优先" in sort_mode:
                             time_bonus = 0
-                            if age == 0: time_bonus = 40
-                            elif age == 1: time_bonus = 20
-                            elif age == 2: time_bonus = 10
+                            if age == 0:
+                                time_bonus = 40
+                            elif age == 1:
+                                time_bonus = 20
+                            elif age == 2:
+                                time_bonus = 10
                         else:
                             time_bonus = max(0, 30 - age * 10)
-                            
+
                         quality_score = min(100.0, cite_score + time_bonus)
-                        
+
                         # 融合真实语义分与质量分
                         item["total_score"] = (rel_score * rel_w) + (quality_score * qual_w)
-                        
-                    st.session_state.search_results.sort(key=lambda x: x.get("total_score", 0), reverse=True)
-                # <--- 【修改点 5 结束】 --->
-                
+
+                    st.session_state.search_results.sort(
+                        key=lambda x: x.get("total_score", 0), reverse=True
+                    )
+
                 st.session_state.citations_loaded = True
-            
+
             st.success(f"✅ 完成，找到 {len(st.session_state.search_results)} 篇")
             preload_top_graphs(st.session_state.search_results, ss_key=ss_api_key, top_n=3)
 
@@ -1214,14 +1384,23 @@ with tab_main:
             g_data = fetch_graph_data(st.session_state.focus_paper_id, ss_key=ss_api_key)
 
         if not g_data:
-            st.warning("⚠️ 暂时无法获取图谱，请稍后再试。")
+            err = st.session_state.get("ss_last_error") or "未知错误"
+            if not ss_api_key:
+                st.warning(
+                    "⚠️ 图谱加载失败：未配置 `SS_API_KEY`。Semantic Scholar 对匿名请求限流很严，"
+                    "建议在 Secrets 中配置后重试。"
+                )
+            else:
+                st.warning(f"⚠️ 暂时无法获取图谱（{err}），已自动重试 3 次，请稍后再试。")
         else:
             gc_graph, gc_info = st.columns([1.6, 1])
             with gc_graph:
                 clicked_id, all_details = render_connected_graph(g_data, min_cite_filter=min_cf)
-                sid = g_data.get('paperId','root')
+                sid = g_data.get("paperId", "root")
                 if sid in all_details:
-                    all_details[sid]['arxiv_id'] = get_pure_arxiv_id(st.session_state.focus_paper_id)
+                    all_details[sid]["arxiv_id"] = get_pure_arxiv_id(
+                        st.session_state.focus_paper_id
+                    )
                 if not (clicked_id and clicked_id in all_details):
                     st.caption("👆 点击节点 → 右侧看完整详情 | 🔴 当前  🟢 引用本文  🔵 本文引用")
 
@@ -1251,30 +1430,48 @@ with tab_main:
                                 {info['abstract']}
                             </div>
                         </div>
-                        """, unsafe_allow_html=True,
+                        """,
+                        unsafe_allow_html=True,
                     )
                     st.markdown("")
                     target_topic = st.selectbox(
-                        "加入主题", list(st.session_state.topics.keys()),
-                        index=list(st.session_state.topics.keys()).index(st.session_state.active_topic),
-                        key="graph_topic_sel", label_visibility="collapsed"
+                        "加入主题",
+                        list(st.session_state.topics.keys()),
+                        index=list(st.session_state.topics.keys()).index(
+                            st.session_state.active_topic
+                        ),
+                        key="graph_topic_sel",
+                        label_visibility="collapsed",
                     )
-                    arxiv_id = info.get('arxiv_id')
-                    ga,gb,gc = st.columns(3)
+                    arxiv_id = info.get("arxiv_id")
+                    ga, gb, gc = st.columns(3)
                     with ga:
-                        if arxiv_id and st.button("⬇️ 入库", type="primary", use_container_width=True, key="ginfo_dl"):
+                        if arxiv_id and st.button(
+                            "⬇️ 入库", type="primary", use_container_width=True, key="ginfo_dl"
+                        ):
                             with st.spinner("下载中..."):
                                 try:
                                     pdf_path = download_arxiv_pdf_direct(arxiv_id)
-                                    if process_and_add_to_topic(pdf_path, info['title'], user_api_key, topic_name=target_topic):
-                                        st.success("✅ 入库成功！"); st.balloons()
-                                except Exception as e: st.error(str(e))
-                        elif not arxiv_id: st.caption("暂无全文")
+                                    if process_and_add_to_topic(
+                                        pdf_path,
+                                        info["title"],
+                                        user_api_key,
+                                        topic_name=target_topic,
+                                    ):
+                                        st.success("✅ 入库成功！")
+                                        st.balloons()
+                                except Exception as e:
+                                    st.error(str(e))
+                        elif not arxiv_id:
+                            st.caption("暂无全文")
                     with gb:
-                        st.link_button("🌐 SS", info['url'], use_container_width=True)
+                        st.link_button("🌐 SS", info["url"], use_container_width=True)
                     with gc:
-                        if info.get('arxiv_id') and st.button("🕸️ 展开", use_container_width=True, key="ginfo_expand"):
-                            st.session_state.focus_paper_id = info['arxiv_id']; st.rerun()
+                        if info.get("arxiv_id") and st.button(
+                            "🕸️ 展开", use_container_width=True, key="ginfo_expand"
+                        ):
+                            st.session_state.focus_paper_id = info["arxiv_id"]
+                            st.rerun()
                 else:
                     st.markdown(
                         """<div style="background:#f1f5f9;border:1px dashed #cbd5e1;border-radius:10px;
@@ -1289,12 +1486,11 @@ with tab_main:
         st.markdown(
             f'<div class="section-divider">📋 检索结果（已加载 {len(st.session_state.search_results)} 篇）'
             f'<span class="perf-badge">⚡ 缓存 {len(st.session_state.citations_global_cache)} 篇</span></div>',
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
 
-        # --- 修改点开始：将下载和打分按钮重构为三列，加入动态数量输入，并新增打包下载 PDF 功能 ---
         col_excel, col_score, col_pdf = st.columns(3)
-        
+
         with col_excel:
             st.write("📊 **导出数据**")
             st.download_button(
@@ -1302,19 +1498,39 @@ with tab_main:
                 data=convert_to_excel(st.session_state.search_results),
                 file_name=f"ArXiv_Search_{datetime.now().strftime('%m%d_%H%M')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
+                use_container_width=True,
             )
 
         with col_score:
-            score_num = st.number_input("⭐ **打分数量 (篇)**", min_value=1, max_value=max(1, len(st.session_state.search_results)), value=min(20, len(st.session_state.search_results)), step=1, key="batch_score_n")
+            score_num = st.number_input(
+                "⭐ **打分数量 (篇)**",
+                min_value=1,
+                max_value=max(1, len(st.session_state.search_results)),
+                value=min(20, len(st.session_state.search_results)),
+                step=1,
+                key="batch_score_n",
+            )
             if st.button(f"🚀 开始打分 (前 {score_num} 篇)", use_container_width=True):
-                with st.spinner(f"🚀 正在后台并行请求 DeepSeek 给前 {score_num} 篇打分，请耐心等待..."):
+                with st.spinner(
+                    f"🚀 正在后台并行请求 DeepSeek 给前 {score_num} 篇打分，请耐心等待..."
+                ):
                     to_process = st.session_state.search_results[:score_num]
-                    pending = [p for p in to_process if p['obj'].title[:60] not in st.session_state.score_cache]
+                    pending = [
+                        p
+                        for p in to_process
+                        if p["obj"].title[:60] not in st.session_state.score_cache
+                    ]
                     if pending:
                         with ThreadPoolExecutor(max_workers=5) as pool:
                             futures = {
-                                pool.submit(get_paper_score, p['obj'].entry_id, p['obj'].title, p['obj'].summary, user_api_key, ss_api_key): p['obj'].title[:60] 
+                                pool.submit(
+                                    get_paper_score,
+                                    p["obj"].entry_id,
+                                    p["obj"].title,
+                                    p["obj"].summary,
+                                    user_api_key,
+                                    ss_api_key,
+                                ): p["obj"].title[:60]
                                 for p in pending
                             }
                             for future in as_completed(futures):
@@ -1326,33 +1542,51 @@ with tab_main:
                 st.success(f"✅ 前 {score_num} 篇论文已打分完毕！")
                 time.sleep(2)
                 st.rerun()
-                
+
         with col_pdf:
             st.write("📦 **下载原文范围 (篇)**")
             c_dl_1, c_dl_2 = st.columns(2)
             with c_dl_1:
-                dl_start = st.number_input("从第", min_value=1, max_value=max(1, len(st.session_state.search_results)), value=1, step=1, key="batch_dl_start")
+                dl_start = st.number_input(
+                    "从第",
+                    min_value=1,
+                    max_value=max(1, len(st.session_state.search_results)),
+                    value=1,
+                    step=1,
+                    key="batch_dl_start",
+                )
             with c_dl_2:
-                dl_end = st.number_input("到第", min_value=dl_start, max_value=max(dl_start, len(st.session_state.search_results)), value=max(dl_start, min(dl_start + 9, len(st.session_state.search_results))), step=1, key="batch_dl_end")
-            
+                dl_end = st.number_input(
+                    "到第",
+                    min_value=dl_start,
+                    max_value=max(dl_start, len(st.session_state.search_results)),
+                    value=max(dl_start, min(dl_start + 9, len(st.session_state.search_results))),
+                    step=1,
+                    key="batch_dl_end",
+                )
+
             if st.button(f"🔄 打包 ZIP ({dl_start}-{dl_end} 篇)", use_container_width=True):
                 # ==========================
-                # --- 新修改点：重构打包逻辑，开启真实硬盘流式传输，彻底防止内存崩溃 ---
                 # ==========================
                 import zipfile
+
                 # 使用硬盘临时文件替代内存缓冲
-                temp_zip_path = os.path.join(tempfile.gettempdir(), f"arxiv_batch_{uuid.uuid4().hex[:8]}.zip")
-                to_dl = st.session_state.search_results[dl_start-1 : dl_end]
+                temp_zip_path = os.path.join(
+                    tempfile.gettempdir(), f"arxiv_batch_{uuid.uuid4().hex[:8]}.zip"
+                )
+                to_dl = st.session_state.search_results[dl_start - 1 : dl_end]
                 dl_total = len(to_dl)
-                
+
                 # 使用状态文本与进度条，保证网页实时与后台通讯
                 status_text = st.empty()
                 progress_bar = st.progress(0)
-                
-                with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+
+                with zipfile.ZipFile(temp_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                     for idx, item in enumerate(to_dl):
-                        res = item['obj']
-                        status_text.text(f"📥 正在提取并压缩 ({idx+1}/{dl_total}): {res.title[:25]}...")
+                        res = item["obj"]
+                        status_text.text(
+                            f"📥 正在提取并压缩 ({idx+1}/{dl_total}): {res.title[:25]}..."
+                        )
                         try:
                             # 增加 1.5 秒安全休眠，防高并发触发 ArXiv 的防 DDoS 封锁
                             time.sleep(1.5)
@@ -1361,23 +1595,26 @@ with tab_main:
                             # 文件名加上原始排名序号，方便对应
                             filename = f"{dl_start + idx}_{safe_title}.pdf"
                             zf.write(p_path, arcname=filename)
-                            os.remove(p_path) 
-                        except Exception as e:
-                            pass 
+                            os.remove(p_path)
+                        except Exception:
+                            pass
                         # 每次循环更新进度，维持前端存活
                         progress_bar.progress((idx + 1) / dl_total)
-                
+
                 status_text.text("✅ 打包完成！正在生成最终下载链接...")
-                
+
                 # 保留文件路径，而不是将几百兆数据塞进内存变量
                 st.session_state.ready_zip_path = temp_zip_path
-                st.session_state.ready_zip_name = f"ArXiv_PDFs_{dl_start}to{dl_end}_{datetime.now().strftime('%m%d_%H%M')}.zip"
+                st.session_state.ready_zip_name = (
+                    f"ArXiv_PDFs_{dl_start}to{dl_end}_{datetime.now().strftime('%m%d_%H%M')}.zip"
+                )
                 # ==========================
-                # --- 新修改点结束 ---
                 # ==========================
-            
+
             # 如果缓存里有打包好的文件路径，打开文件流供按钮下载，零内存占用！
-            if st.session_state.get("ready_zip_path") and os.path.exists(st.session_state.get("ready_zip_path")):
+            if st.session_state.get("ready_zip_path") and os.path.exists(
+                st.session_state.get("ready_zip_path")
+            ):
                 with open(st.session_state.ready_zip_path, "rb") as f:
                     st.download_button(
                         label="✅ 点击下载压缩包",
@@ -1385,51 +1622,67 @@ with tab_main:
                         file_name=st.session_state.ready_zip_name,
                         mime="application/zip",
                         use_container_width=True,
-                        type="primary"
+                        type="primary",
                     )
-        # --- 修改点结束 ---
-        
+
         st.markdown("---")
-        
+
         for i, item in enumerate(st.session_state.search_results):
-            res   = item['obj']
-            cites = item['citations']
-            cite_html = (f"<span class='cite-badge'>{cites}</span>" if cites is not None
-                         else "<span class='cite-loading'>加载中…</span>")
+            res = item["obj"]
+            cites = item["citations"]
+            cite_html = (
+                f"<span class='cite-badge'>{cites}</span>"
+                if cites is not None
+                else "<span class='cite-loading'>加载中…</span>"
+            )
             with st.expander(f"#{i+1} {res.title} ({res.published.year})"):
-                # <--- 【修改点 6：在每篇论文展开的标题栏，同时显示刚刚算出来的真实向量分数】 --->
                 sim_display = f" | 🎯 匹配度: {round(item.get('sim_score', 0), 1)}%"
                 st.markdown(
                     f"**{', '.join([a.name for a in res.authors])}** | "
                     f"{res.published.strftime('%Y-%m-%d')} | 引用：{cite_html}{sim_display}",
-                    unsafe_allow_html=True
+                    unsafe_allow_html=True,
                 )
                 ck = res.title[:60]
-                cc, cg, cs = st.columns([4,1,1])
+                cc, cg, cs = st.columns([4, 1, 1])
                 with cc:
                     box_content = ""
                     if ck in st.session_state.contributions_cache:
-                        box_content += f"💡 <b>贡献:</b> {st.session_state.contributions_cache[ck]}<br>"
+                        box_content += (
+                            f"💡 <b>贡献:</b> {st.session_state.contributions_cache[ck]}<br>"
+                        )
                     else:
-                        box_content += "💡 <span style='color:#aaa;'>点击右侧 ✨ 生成核心贡献摘要</span><br>"
+                        box_content += (
+                            "💡 <span style='color:#aaa;'>点击右侧 ✨ 生成核心贡献摘要</span><br>"
+                        )
                     if ck in st.session_state.score_cache:
                         box_content += f"⭐ <b>评分:</b> {st.session_state.score_cache[ck]}"
                     else:
-                        box_content += "⭐ <span style='color:#aaa;'>点击右侧 ⭐ 获取SS综合打分</span>"
-                    st.markdown(f'<div class="contribution-box">{box_content}</div>', unsafe_allow_html=True)
+                        box_content += (
+                            "⭐ <span style='color:#aaa;'>点击右侧 ⭐ 获取SS综合打分</span>"
+                        )
+                    st.markdown(
+                        f'<div class="contribution-box">{box_content}</div>', unsafe_allow_html=True
+                    )
                 with cg:
                     if st.button("✨ 摘要", key=f"contrib_{i}"):
-                        with st.spinner("分析..."): get_one_line_contribution(res.summary, res.title, user_api_key)
+                        with st.spinner("分析..."):
+                            get_one_line_contribution(res.summary, res.title, user_api_key)
                         st.rerun()
                 with cs:
                     if st.button("⭐ 打分", key=f"score_{i}"):
-                        with st.spinner("获取SS数据并打分..."): 
-                            score = get_paper_score(res.entry_id, res.title, res.summary, user_api_key, ss_api_key)
+                        with st.spinner("获取SS数据并打分..."):
+                            score = get_paper_score(
+                                res.entry_id, res.title, res.summary, user_api_key, ss_api_key
+                            )
                             st.session_state.score_cache[ck] = score
                         st.rerun()
-                st.markdown(f'<div class="abstract-box"><b>摘要：</b>{res.summary.replace(chr(10)," ")}</div>', unsafe_allow_html=True)
-                b1,b2,b3 = st.columns(3)
-                with b1: st.markdown(f"[🔗 ArXiv]({res.entry_id})")
+                st.markdown(
+                    f'<div class="abstract-box"><b>摘要：</b>{res.summary.replace(chr(10)," ")}</div>',
+                    unsafe_allow_html=True,
+                )
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    st.markdown(f"[🔗 ArXiv]({res.entry_id})")
                 with b2:
                     if st.button("⬇️ 下载入库", key=f"dl_{i}"):
                         with st.spinner("下载解析..."):
@@ -1437,120 +1690,139 @@ with tab_main:
                                 pdf_path = download_arxiv_pdf_direct(res.entry_id)
                                 process_and_add_to_topic(pdf_path, res.title, user_api_key)
                                 st.success("入库成功！")
-                            except Exception as e: st.error(str(e))
+                            except Exception as e:
+                                st.error(str(e))
                 with b3:
-                    lbl = "🕸️ 图谱 ⚡" if res.entry_id in st.session_state.preload_done_ids else "🕸️ 图谱"
+                    lbl = (
+                        "🕸️ 图谱 ⚡"
+                        if res.entry_id in st.session_state.preload_done_ids
+                        else "🕸️ 图谱"
+                    )
                     if st.button(lbl, key=f"graph_{i}"):
-                        st.session_state.focus_paper_id = res.entry_id; st.rerun()
-        
+                        st.session_state.focus_paper_id = res.entry_id
+                        st.rerun()
+
     if st.session_state.search_generator:
         st.markdown("---")
-        # --- 修改点：按钮文案同步修改为 100 篇 ---
         if st.button("🔽 加载更多 100 篇...", use_container_width=True):
             with st.spinner("正在拉取新论文摘要并计算语义分数..."):
-                # --- 修改点：每次额外拉取数量提升到 100 ---
                 more_raw = list(itertools.islice(st.session_state.search_generator, 100))
                 if more_raw:
                     new_results = [{"obj": r, "citations": None} for r in more_raw]
-                    
-                    # <--- 【修改点 7：在“加载更多”时，也必须对这新来的 100 篇计算真实的语义分数】 --->
+
                     try:
                         embeddings_model = get_embeddings_model()
                         query_vec = np.array(embeddings_model.embed_query(search_query))
-                        abstracts = [item['obj'].summary for item in new_results]
+                        abstracts = [item["obj"].summary for item in new_results]
                         doc_vecs = np.array(embeddings_model.embed_documents(abstracts))
                         norms_doc = np.linalg.norm(doc_vecs, axis=1)
                         norm_query = np.linalg.norm(query_vec)
                         similarities = np.dot(doc_vecs, query_vec) / (norms_doc * norm_query)
                         for idx, item in enumerate(new_results):
-                            item['sim_score'] = float(similarities[idx]) * 100 
-                    except Exception as e:
+                            item["sim_score"] = float(similarities[idx]) * 100
+                    except Exception:
                         for item in new_results:
-                            item['sim_score'] = 50.0 
-                    # <--- 【修改点 7 结束】 --->
+                            item["sim_score"] = 50.0
 
                     id2c = smart_fetch_citations(new_results, ss_key=ss_api_key)
                     for item in new_results:
-                        item["citations"] = id2c.get(item['obj'].entry_id, 0)
+                        item["citations"] = id2c.get(item["obj"].entry_id, 0)
                     st.session_state.search_results.extend(new_results)
-                    
+
                     if "引用量" in sort_mode:
-                        st.session_state.search_results.sort(key=lambda x: x["citations"] or 0, reverse=True)
+                        st.session_state.search_results.sort(
+                            key=lambda x: x["citations"] or 0, reverse=True
+                        )
                     elif "质量优先" in sort_mode or "综合" in sort_mode:
                         import math
+
                         current_year = datetime.now().year
                         for idx, item in enumerate(st.session_state.search_results):
-                            # <--- 【修改点 8：废弃伪相关性，应用真实分数】 --->
-                            rel_score = item.get('sim_score', 50.0)
-                            
+                            rel_score = item.get("sim_score", 50.0)
+
                             cites = item["citations"] or 0
                             cite_score = (math.log10(cites + 1) / 3.0) * 100
-                            
-                            pub_year = item['obj'].published.year
+
+                            pub_year = item["obj"].published.year
                             age = max(0, current_year - pub_year)
-                            
+
                             if "质量优先" in sort_mode:
                                 time_bonus = 0
-                                if age == 0: time_bonus = 40
-                                elif age == 1: time_bonus = 20
-                                elif age == 2: time_bonus = 10
+                                if age == 0:
+                                    time_bonus = 40
+                                elif age == 1:
+                                    time_bonus = 20
+                                elif age == 2:
+                                    time_bonus = 10
                             else:
                                 time_bonus = max(0, 30 - age * 10)
-                                
+
                             quality_score = min(100.0, cite_score + time_bonus)
                             item["total_score"] = (rel_score * rel_w) + (quality_score * qual_w)
-                            
-                        st.session_state.search_results.sort(key=lambda x: x.get("total_score", 0), reverse=True)
+
+                        st.session_state.search_results.sort(
+                            key=lambda x: x.get("total_score", 0), reverse=True
+                        )
                     st.rerun()
                 else:
                     st.info("✨ 到底啦。")
-   
-    
+
+
 # ══════════════════════════════════════════
 # Tab 2：研读空间
 # ══════════════════════════════════════════
 with tab_read:
     # --- 1. 顶部控制栏：精准控制 Scope ---
     t = active_topic_data()
-    
+
     # 布局：左侧选模式，右侧状态显示
     c_ctrl, c_info = st.columns([2, 3])
     with c_ctrl:
         # 核心修改：明确的范围选择，不再默认全库检索
         scope_options = ["🌐 全库综合 (对比/综述)"] + t["files"]
         selected_scope = st.selectbox(
-            "📚 阅读范围 (Scope)", 
+            "📚 阅读范围 (Scope)",
             scope_options,
             index=0,
-            help="选择“全库”进行跨论文对比；选择“单篇”将只检索该论文内容，更省 Token 且更精准。"
+            help="选择“全库”进行跨论文对比；选择“单篇”将只检索该论文内容，更省 Token 且更精准。",
         )
     with c_info:
         # 显示当前 Token 使用情况预估或入库状态
         if selected_scope == "🌐 全库综合 (对比/综述)":
             st.caption(f"🚀 当前模式：检索所有 {len(t['files'])} 篇论文")
         else:
-            st.caption(f"🎯 当前模式：**专注研读** (已屏蔽其他论文干扰)")
+            st.caption("🎯 当前模式：**专注研读** (已屏蔽其他论文干扰)")
 
     st.divider()
 
     # --- 【新增功能块：多文献对比矩阵与溯源综述生成】 ---
     if selected_scope == "🌐 全库综合 (对比/综述)" and len(t["files"]) > 0:
         with st.expander("📊 多文献结构化对比与综述生成 (Hybrid RAG 赋能)", expanded=False):
-            st.markdown("支持勾选多篇论文，系统将自动提取各项特征并渲染结构化矩阵，同时生成**带真实原文引证与段落脚标**的文献综述。")
-            matrix_papers = st.multiselect("📌 勾选需对比的文献（建议 2-5 篇，避免超量）", t["files"], default=t["files"][:3] if len(t["files"]) >= 2 else t["files"])
-            
+            st.markdown(
+                "支持勾选多篇论文，系统将自动提取各项特征并渲染结构化矩阵，同时生成**带真实原文引证与段落脚标**的文献综述。"
+            )
+            matrix_papers = st.multiselect(
+                "📌 勾选需对比的文献（建议 2-5 篇，避免超量）",
+                t["files"],
+                default=t["files"][:3] if len(t["files"]) >= 2 else t["files"],
+            )
+
             if st.button("🚀 抽取文献生成矩阵与综述", use_container_width=True) and matrix_papers:
-                with st.spinner("🧠 正在提取文献片段，构建对比矩阵及追溯综述初稿（这可能需要一些时间，请耐心等待）..."):
+                with st.spinner(
+                    "🧠 正在提取文献片段，构建对比矩阵及追溯综述初稿（这可能需要一些时间，请耐心等待）..."
+                ):
                     try:
                         # 步骤 1：为防止 Token 爆炸，每篇论文取前 15 个代表性文档块（通常包含摘要与引言）
                         refs_text = ""
                         for p in matrix_papers:
-                            p_chunks = [c for c in t["chunks"] if c.metadata.get("source_paper") == p][:15]
+                            p_chunks = [
+                                c for c in t["chunks"] if c.metadata.get("source_paper") == p
+                            ][:15]
                             refs_text += f"\n\n【文献：{p}】\n"
                             for idx, c in enumerate(p_chunks):
-                                page_num = c.metadata.get('page', 0) + 1
+                                page_num = c.metadata.get("page", 0) + 1
                                 refs_text += f"[P{page_num} | 段落{idx+1}] {c.page_content}\n"
-                        
+
                         # 步骤 2：调用大模型进行信息整合与综述
                         llm = get_deepseek_llm(USER_API_KEY, temperature=0.1)
                         matrix_prompt = (
@@ -1562,10 +1834,10 @@ with tab_read:
                             "**【致命要求】**：综述中的每一条结论，必须严格使用真实的原文页码与段落脚标进行引用溯源。格式例如：`（《某文献名》[P页码|段落X]）`。绝对禁止大模型编造任何未在资料中出现的虚假指标或事实。\n\n"
                             f"### 论文资料库（仅以此为准）：\n{refs_text}"
                         )
-                        
+
                         res_matrix = llm.invoke(matrix_prompt)
                         st.markdown(res_matrix.content)
-                        
+
                         # 步骤 3：自动存入笔记系统（同时写入云端，刷新后可恢复）
                         new_note = {
                             "id": str(uuid.uuid4())[:8],
@@ -1577,9 +1849,13 @@ with tab_read:
                         }
                         st.session_state.notes.append(new_note)
                         if save_note_to_cloud(new_note):
-                            st.success("✅ 矩阵与综述生成完毕！内容已自动保存至「📌 我的笔记」（云端已同步）。")
+                            st.success(
+                                "✅ 矩阵与综述生成完毕！内容已自动保存至「📌 我的笔记」（云端已同步）。"
+                            )
                         else:
-                            st.warning("⚠️ 内容已保存在当前页面，但云端同步失败，将自动重试；也可在「📌 我的笔记」页手动同步。")
+                            st.warning(
+                                "⚠️ 内容已保存在当前页面，但云端同步失败，将自动重试；也可在「📌 我的笔记」页手动同步。"
+                            )
                     except Exception as e:
                         st.error(f"生成失败，请检查网络或日志：{e}")
         st.divider()
@@ -1589,10 +1865,14 @@ with tab_read:
     if not st.session_state.chat_history:
         # 欢迎引导语
         with st.chat_message("assistant"):
-            st.markdown(f"👋 我是你的 DeepSeek 研读助手。当前主题库中有 **{len(t['files'])}** 篇论文。")
+            st.markdown(
+                f"👋 我是你的 DeepSeek 研读助手。当前主题库中有 **{len(t['files'])}** 篇论文。"
+            )
             if t["files"]:
-                st.markdown("你可以问我：\n- *这篇论文的核心方法是什么？* (建议选择单篇范围)\n- *对比 Transformer 和 CNN 在这些论文中的观点差异* (建议选择全库范围)")
-    
+                st.markdown(
+                    "你可以问我：\n- *这篇论文的核心方法是什么？* (建议选择单篇范围)\n- *对比 Transformer 和 CNN 在这些论文中的观点差异* (建议选择全库范围)"
+                )
+
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -1614,12 +1894,12 @@ with tab_read:
             # 占位符用于流式输出
             message_placeholder = st.empty()
             full_response = ""
-            
+
             try:
                 # --- 核心优化 A：精准检索策略 ---
                 search_kwargs = {}
                 filter_rule = None
-                
+
                 # 如果选择了特定论文，构建 metadata 过滤器
                 if selected_scope != "🌐 全库综合 (对比/综述)":
                     filter_rule = {"source_paper": selected_scope}
@@ -1630,14 +1910,14 @@ with tab_read:
                     status_text = f"🔍 正在运用混合检索管线全库 {len(t['files'])} 篇论文中检索..."
 
                 with st.spinner(status_text):
-                    # --- 【修改点：核心植入 - 混合检索管线 (Hybrid RAG Pipeline)】 ---
                     try:
-                        from rank_bm25 import BM25Okapi
-                        from sentence_transformers import CrossEncoder
-                        
                         # 步骤 1：圈定检索大池子
                         if filter_rule:
-                            target_chunks = [c for c in t["chunks"] if c.metadata.get("source_paper") == selected_scope]
+                            target_chunks = [
+                                c
+                                for c in t["chunks"]
+                                if c.metadata.get("source_paper") == selected_scope
+                            ]
                             ss_data = fetch_ss_paper_details_by_title(selected_scope, ss_api_key)
                         else:
                             target_chunks = t["chunks"]
@@ -1648,41 +1928,53 @@ with tab_read:
                         else:
                             # 步骤 2：字面检索 (BM25) - 确保算法代号、数学公式、专有名词零遗漏
                             # 采用粗粒度（字符或单词级别）分词构建语料库
-                            bm25 = get_bm25(target_chunks, f"{st.session_state.active_topic}:{selected_scope}")
+                            bm25 = get_bm25(
+                                target_chunks, f"{st.session_state.active_topic}:{selected_scope}"
+                            )
                             query_tokens = list(prompt.lower())
                             bm25_scores = bm25.get_scores(query_tokens)
                             # 取 BM25 结果前 50 名候选
                             top_bm25_idx = np.argsort(bm25_scores)[::-1][:50]
-                            
+
                             # 步骤 3：语义检索 (Dense Embedding) - 捕捉上下文抽象语义与同义词
                             dense_kwargs = search_kwargs.copy()
                             dense_kwargs["k"] = 50  # 同样扩大至前 50
-                            if "fetch_k" in dense_kwargs: del dense_kwargs["fetch_k"]
-                            if "lambda_mult" in dense_kwargs: del dense_kwargs["lambda_mult"]
+                            if "fetch_k" in dense_kwargs:
+                                del dense_kwargs["fetch_k"]
+                            if "lambda_mult" in dense_kwargs:
+                                del dense_kwargs["lambda_mult"]
                             # 通过 Pinecone 发起密集向量召回
                             dense_docs = t["db"].similarity_search(prompt, **dense_kwargs)
-                            
+
                             # 步骤 4：排序融合 (RRF) - 消除两路检索分数值的量纲差异
                             rrf_k = 60
                             rrf_scores = {}
-                            
+
                             # 将 BM25 排名汇入 RRF
                             for rank, idx in enumerate(top_bm25_idx):
                                 content = target_chunks[idx].page_content
-                                rrf_scores[content] = rrf_scores.get(content, 0.0) + 1.0 / (rank + 1 + rrf_k)
-                                
+                                rrf_scores[content] = rrf_scores.get(content, 0.0) + 1.0 / (
+                                    rank + 1 + rrf_k
+                                )
+
                             # 将 Dense 排名汇入 RRF
                             for rank, d in enumerate(dense_docs):
                                 content = d.page_content
-                                rrf_scores[content] = rrf_scores.get(content, 0.0) + 1.0 / (rank + 1 + rrf_k)
-                                
+                                rrf_scores[content] = rrf_scores.get(content, 0.0) + 1.0 / (
+                                    rank + 1 + rrf_k
+                                )
+
                             # 排序融合后取出最高分的前 50 组去重文本
-                            sorted_rrf = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:50]
+                            sorted_rrf = sorted(
+                                rrf_scores.items(), key=lambda x: x[1], reverse=True
+                            )[:50]
                             candidate_texts = [x[0] for x in sorted_rrf]
-                            
+
                             # 重新映射回原 LangChain Document 对象以便后续取 Metadata
                             text_to_doc = {c.page_content: c for c in target_chunks}
-                            candidate_docs = [text_to_doc[txt] for txt in candidate_texts if txt in text_to_doc]
+                            candidate_docs = [
+                                text_to_doc[txt] for txt in candidate_texts if txt in text_to_doc
+                            ]
 
                             # 步骤 5：深度重排 (Cross-Encoder Re-rank)
                             # 调用 HuggingFace 的交叉编码器对 Query 与 Chunk 进行双向全注意力打分
@@ -1690,7 +1982,7 @@ with tab_read:
                             cross_encoder = get_cross_encoder()
                             cross_inp = [[prompt, d.page_content] for d in candidate_docs]
                             cross_scores = cross_encoder.predict(cross_inp)
-                            
+
                             # 挑选出重排后的候选块输送给大语言模型
                             top_cross_indices = np.argsort(cross_scores)[::-1]
                             docs, chosen = [], set()
@@ -1706,26 +1998,29 @@ with tab_read:
                                     if src in seen_papers:
                                         continue
                                     seen_papers.add(src)
-                                    docs.append(d); chosen.add(i)
+                                    docs.append(d)
+                                    chosen.add(i)
                                 # 第二轮：候选覆盖的论文不足 5 篇时，用剩余高分块补齐
                                 for i in top_cross_indices:
                                     if len(docs) >= 5:
                                         break
                                     if i not in chosen:
-                                        docs.append(candidate_docs[i]); chosen.add(i)
+                                        docs.append(candidate_docs[i])
+                                        chosen.add(i)
                             else:
                                 docs = [candidate_docs[i] for i in top_cross_indices[:5]]
-                            
+
                     except Exception as hybrid_err:
                         # 降级预案：如因缺失库或其他原因导致混合管线崩溃，静默退回原始向量检索以防卡死
-                        st.warning(f"由于缺少部分依赖库(如 rank_bm25 / sentence_transformers)，混合检索退回基础向量检索模式。({hybrid_err})")
+                        st.warning(
+                            f"由于缺少部分依赖库(如 rank_bm25 / sentence_transformers)，混合检索退回基础向量检索模式。({hybrid_err})"
+                        )
                         if filter_rule:
                             docs = t["db"].similarity_search(prompt, **search_kwargs)
                             ss_data = fetch_ss_paper_details_by_title(selected_scope, ss_api_key)
                         else:
                             docs = t["db"].max_marginal_relevance_search(prompt, **search_kwargs)
                             ss_data = None
-                    # --- 【混合检索修改点结束】 ---
 
                 # --- 核心优化 B：构建更智能的 Prompt ---
                 if not docs:
@@ -1736,17 +2031,20 @@ with tab_read:
                     context_text = ""
                     refs = []
                     for i, d in enumerate(docs):
-                        src = d.metadata.get('source_paper', '未知')
-                        page = d.metadata.get('page', 0) + 1 # PyPDFLoader通常从0开始
-                        snippet = d.page_content.replace('\n', ' ')
+                        src = d.metadata.get("source_paper", "未知")
+                        page = d.metadata.get("page", 0) + 1  # PyPDFLoader通常从0开始
+                        snippet = d.page_content.replace("\n", " ")
                         context_text += f"[资料{i+1} | {src} (P{page})]: {snippet}\n\n"
                         refs.append(f"**[{i+1}] {src} (P{page})**: {snippet[:100]}...")
-                        
-                    # --- 修改点：如果获取到了 SS 真实数据，注入给 LLM ---
+
                     ss_context = ""
                     if ss_data:
-                        tldr = ss_data.get('tldr', {}).get('text', '无') if ss_data.get('tldr') else '无'
-                        authors = ", ".join([a.get('name', '') for a in ss_data.get('authors', [])])
+                        tldr = (
+                            ss_data.get("tldr", {}).get("text", "无")
+                            if ss_data.get("tldr")
+                            else "无"
+                        )
+                        authors = ", ".join([a.get("name", "") for a in ss_data.get("authors", [])])
                         ss_context = (
                             f"\n\n【Semantic Scholar 真实元数据补充】\n"
                             f"- 标题: {ss_data.get('title')}\n"
@@ -1778,31 +2076,38 @@ with tab_read:
                         )
 
                     # --- 核心优化 C：调用 DeepSeek (流式) ---
-                    with st.expander("📚 查看 AI (由混合管线重排推荐) 参考的原文片段", expanded=False):
+                    with st.expander(
+                        "📚 查看 AI (由混合管线重排推荐) 参考的原文片段", expanded=False
+                    ):
                         st.markdown("\n\n".join(refs))
 
                     llm = get_deepseek_llm(USER_API_KEY, temperature=0.3)
-                    
+
                     messages = [
-                        {"role": "system", "content": f"{sys_prompt}\n\n### 检索到的资料：\n{context_text}"},
-                        {"role": "user", "content": prompt}
+                        {
+                            "role": "system",
+                            "content": f"{sys_prompt}\n\n### 检索到的资料：\n{context_text}",
+                        },
+                        {"role": "user", "content": prompt},
                     ]
-                    
+
                     stream = llm.stream(messages)
-                    
+
                     for chunk in stream:
                         if chunk.content:
                             full_response += chunk.content
                             message_placeholder.markdown(full_response)
-                    
-                    message_placeholder.markdown(full_response) 
 
-                st.session_state.chat_history.append({"role": "assistant", "content": full_response})
-                
+                    message_placeholder.markdown(full_response)
+
+                st.session_state.chat_history.append(
+                    {"role": "assistant", "content": full_response}
+                )
+
                 st.session_state.pending_note = {
-                    "content": full_response, 
+                    "content": full_response,
                     "question": prompt,
-                    "has_gap": detect_knowledge_gap(full_response, docs)
+                    "has_gap": detect_knowledge_gap(full_response, docs),
                 }
 
             except Exception as e:
@@ -1812,9 +2117,13 @@ with tab_read:
         st.markdown("---")
         c_note_1, c_note_2 = st.columns([5, 1])
         with c_note_1:
-            note_tags = st.text_input("给刚才的回答加个标签？(可选)", placeholder="例如: 核心算法, 实验结果", key="quick_note_tag")
+            note_tags = st.text_input(
+                "给刚才的回答加个标签？(可选)",
+                placeholder="例如: 核心算法, 实验结果",
+                key="quick_note_tag",
+            )
         with c_note_2:
-            st.write("") 
+            st.write("")
             if st.button("📌 存笔记"):
                 tags = [t.strip() for t in note_tags.split(",")] if note_tags else []
                 new_note = {
@@ -1858,40 +2167,57 @@ with tab_notes:
         )
 
     if not st.session_state.notes:
-        st.info("还没有笔记。在「📖 研读空间」提问后点「📌 存笔记」即可；笔记会同步到云端，刷新或换设备后自动恢复。")
+        st.info(
+            "还没有笔记。在「📖 研读空间」提问后点「📌 存笔记」即可；笔记会同步到云端，刷新或换设备后自动恢复。"
+        )
     else:
-        all_tags   = sorted(set(tag for n in st.session_state.notes for tag in n["tags"]))
+        all_tags = sorted(set(tag for n in st.session_state.notes for tag in n["tags"]))
         all_topics = sorted(set(n["topic"] for n in st.session_state.notes))
-        f1,f2,f3 = st.columns([2,2,2])
-        with f1: filter_tag    = st.selectbox("按标签",["全部"]+all_tags)
-        with f2: filter_topic  = st.selectbox("按主题",["全部"]+all_topics)
-        with f3: search_note   = st.text_input("关键词", placeholder="搜索笔记")
+        f1, f2, f3 = st.columns([2, 2, 2])
+        with f1:
+            filter_tag = st.selectbox("按标签", ["全部"] + all_tags)
+        with f2:
+            filter_topic = st.selectbox("按主题", ["全部"] + all_topics)
+        with f3:
+            search_note = st.text_input("关键词", placeholder="搜索笔记")
 
         filtered = st.session_state.notes.copy()
-        if filter_tag    != "全部": filtered = [n for n in filtered if filter_tag in n["tags"]]
-        if filter_topic  != "全部": filtered = [n for n in filtered if n["topic"] == filter_topic]
-        if search_note:             filtered = [n for n in filtered if search_note.lower() in (n["content"]+n.get("question","")).lower()]
+        if filter_tag != "全部":
+            filtered = [n for n in filtered if filter_tag in n["tags"]]
+        if filter_topic != "全部":
+            filtered = [n for n in filtered if n["topic"] == filter_topic]
+        if search_note:
+            filtered = [
+                n
+                for n in filtered
+                if search_note.lower() in (n["content"] + n.get("question", "")).lower()
+            ]
 
         st.caption(f"共 {len(filtered)} 条")
         for note in reversed(filtered):
             with st.container(border=True):
-                h1,h2,h3 = st.columns([3,2,1])
+                h1, h2, h3 = st.columns([3, 2, 1])
             with h1:
-                st.markdown(f'<span class="topic-badge">🗂️ {note["topic"]}</span>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<span class="topic-badge">🗂️ {note["topic"]}</span>', unsafe_allow_html=True
+                )
                 for tag in note["tags"]:
                     st.markdown(f'<span class="note-tag">#{tag}</span>', unsafe_allow_html=True)
-            with h2: st.caption(f"🕐 {note['ts']}")
+            with h2:
+                st.caption(f"🕐 {note['ts']}")
             with h3:
                 if st.button("🗑️", key=f"delnote_{note['id']}"):
                     # 先删云端，成功后再删本地；失败则保留，避免刷新后又“复活”
                     if delete_notes_in_cloud([note["id"]]):
-                        st.session_state.notes = [n for n in st.session_state.notes if n["id"] != note["id"]]
+                        st.session_state.notes = [
+                            n for n in st.session_state.notes if n["id"] != note["id"]
+                        ]
                     else:
                         st.toast("云端删除失败，笔记已保留，请稍后重试", icon="⚠️")
                     st.rerun()
             if note.get("question"):
                 st.markdown(f"**❓ {note['question']}**")
-            st.markdown(note["content"])   # 完整内容，不截断
+            st.markdown(note["content"])  # 完整内容，不截断
 
         st.markdown("---")
         if st.button("🗑️ 清空所有笔记", type="secondary"):
