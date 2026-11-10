@@ -305,6 +305,25 @@ def _list_namespace_ids(idx, ns):
     return ids
 
 
+def _fetch_vectors(idx, ids, ns, max_url_chars=3000):
+    """批量取向量。Pinecone 的 fetch 走 GET，id 全部拼在 URL 上，
+    500 个 UUID 约 20KB，会超过网关上限直接返回 414，故按 URL 长度分组。"""
+    vectors = {}
+    batch, size = [], 0
+    for vid in ids:
+        cost = len(str(vid)) + 5  # "&ids=" + id
+        if batch and size + cost > max_url_chars:
+            got = idx.fetch(ids=batch, namespace=ns)
+            vectors.update(getattr(got, "vectors", None) or {})
+            batch, size = [], 0
+        batch.append(vid)
+        size += cost
+    if batch:
+        got = idx.fetch(ids=batch, namespace=ns)
+        vectors.update(getattr(got, "vectors", None) or {})
+    return vectors
+
+
 def restore_topic_from_pinecone(topic_name, verbose=False):
     """从 Pinecone 云端恢复某主题已入库的论文清单与切片，支持重开页面继续研读。"""
     t = st.session_state.topics.get(topic_name)
@@ -340,18 +359,16 @@ def restore_topic_from_pinecone(topic_name, verbose=False):
             return
 
         docs, files = [], []
-        for start in range(0, len(ids), 500):
-            fetched = idx.fetch(ids=ids[start : start + 500], namespace=ns)
-            vectors = getattr(fetched, "vectors", None) or {}
-            for v in vectors.values():
-                md = dict(getattr(v, "metadata", None) or {})
-                text = md.pop("text", "") or ""
-                if not text:
-                    continue
-                docs.append(Document(page_content=text, metadata=md))
-                sp = md.get("source_paper")
-                if sp and sp not in files:
-                    files.append(sp)
+        vectors = _fetch_vectors(idx, ids, ns)
+        for v in vectors.values():
+            md = dict(getattr(v, "metadata", None) or {})
+            text = md.pop("text", "") or ""
+            if not text:
+                continue
+            docs.append(Document(page_content=text, metadata=md))
+            sp = md.get("source_paper")
+            if sp and sp not in files:
+                files.append(sp)
 
         if docs:
             t["chunks"], t["files"] = docs, files
@@ -385,10 +402,7 @@ def migrate_legacy_namespaces(topic_name):
     for s in src:
         try:
             ids = _list_namespace_ids(idx, s)
-            vecs = {}
-            for start in range(0, len(ids), 500):
-                fetched = idx.fetch(ids=ids[start : start + 500], namespace=s)
-                vecs.update(getattr(fetched, "vectors", None) or {})
+            vecs = _fetch_vectors(idx, ids, s)
             for _vid, v in vecs.items():
                 md = dict(getattr(v, "metadata", None) or {})
                 text = (md.get("text") or "").strip()
@@ -547,15 +561,13 @@ def load_notes_from_cloud():
     idx = _pinecone_index()
     ids = _list_namespace_ids(idx, ns)
     notes = []
-    for start in range(0, len(ids), 500):
-        fetched = idx.fetch(ids=ids[start : start + 500], namespace=ns)
-        for v in (getattr(fetched, "vectors", None) or {}).values():
-            md = dict(getattr(v, "metadata", None) or {})
-            if md.get("type") != "note":
-                continue
-            n = _metadata_to_note(md)
-            if n["id"] and n["content"]:
-                notes.append(n)
+    for v in _fetch_vectors(idx, ids, ns).values():
+        md = dict(getattr(v, "metadata", None) or {})
+        if md.get("type") != "note":
+            continue
+        n = _metadata_to_note(md)
+        if n["id"] and n["content"]:
+            notes.append(n)
     notes.sort(key=lambda n: n.get("ts") or "")
     return notes
 
