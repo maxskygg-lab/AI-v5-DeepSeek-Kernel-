@@ -114,8 +114,13 @@ def _get_secret(name, default=""):
     return os.getenv(name, default)
 
 
+def _clean_ss_key(raw):
+    """去掉粘贴污染（引号、换行、空格）。带污染的 Key 会被服务端一律判 403。"""
+    return str(raw or "").replace("\r", "").replace("\n", "").strip().strip("\"'").strip()
+
+
 USER_API_KEY = _get_secret("DEEPSEEK_API_KEY")
-SS_API_KEY = _get_secret("SS_API_KEY")
+SS_API_KEY = _clean_ss_key(_get_secret("SS_API_KEY"))
 
 PINECONE_API_KEY = _get_secret("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = _get_secret("PINECONE_INDEX_NAME", "arxiv-papers")
@@ -665,21 +670,42 @@ def auto_batch_contributions(results, api_key, limit=50):
                 pass
 
 
+def _ss_headers(ss_key):
+    return {"x-api-key": ss_key} if ss_key else {}
+
+
+def _ss_error_text(status):
+    """把 Semantic Scholar 的状态码翻译成可读原因。403 只代表 Key 无效或已失效。"""
+    if status == 403:
+        return "API Key 无效或已失效（HTTP 403）"
+    if status == 429:
+        return "Semantic Scholar 限流（HTTP 429），请稍后重试"
+    if status >= 500:
+        return f"Semantic Scholar 服务端异常（HTTP {status}）"
+    return f"HTTP {status}"
+
+
+def _ss_get_json(url, ss_key="", timeout=12):
+    r = requests.get(url, headers=_ss_headers(ss_key), timeout=timeout)
+    if r.status_code != 200:
+        raise requests.HTTPError(_ss_error_text(r.status_code), response=r)
+    return r.json()
+
+
 @st.cache_data(ttl=1800)
 def fetch_citations_batch_cached(arxiv_ids_tuple: tuple, ss_key=None) -> dict:
     clean_ids = [f"ArXiv:{get_pure_arxiv_id(arxiv_id)}" for arxiv_id in arxiv_ids_tuple]
     url = "https://api.semanticscholar.org/graph/v1/paper/batch"
-    headers = {"x-api-key": ss_key} if ss_key else {}
     r = requests.post(
         url,
-        headers=headers,
+        headers=_ss_headers(ss_key or ""),
         params={"fields": "citationCount,externalIds"},
         json={"ids": clean_ids},
         timeout=15,
     )
-    # 失败时抛异常，避免把空结果缓存 30 分钟（否则看起来像“功能失效”）
+    # 失败抛异常而不是返回 {}，否则空结果会被缓存 30 分钟
     if r.status_code != 200:
-        raise RuntimeError(f"Semantic Scholar 返回 HTTP {r.status_code}")
+        raise requests.HTTPError(_ss_error_text(r.status_code), response=r)
     out = {}
     for item in r.json():
         if item and item.get("externalIds"):
@@ -722,8 +748,7 @@ def smart_fetch_citations(results, ss_key=None):
         ids = tuple(item["obj"].entry_id for item in missing)
         try:
             new_data = fetch_citations_batch_cached(ids, ss_key)
-        except Exception as e:
-            st.session_state["ss_last_error"] = str(e)
+        except Exception:
             new_data = {}
         if not new_data:
             new_data = {
@@ -749,14 +774,22 @@ def preload_top_graphs(results, ss_key=None, top_n=3):
     ph = st.empty()
     ph.caption(f"🔄 后台预加载 Top {len(to_do)} 图谱…")
     for item in to_do:
-        fetch_graph_data(item["obj"].entry_id, ss_key=ss_key)
+        try:
+            fetch_graph_data(item["obj"].entry_id, ss_key=ss_key)
+        except requests.RequestException:
+            pass  # 预加载失败不影响主流程，用户点开时会再次请求
         done.add(item["obj"].entry_id)
         time.sleep(0.3)
     ph.caption("✅ 图谱预加载完成")
 
 
+@st.cache_data(ttl=3600)
 def fetch_graph_data(arxiv_id, ss_key=None):
-    """外层不加 cache：只有成功载荷会被 _fetch_graph_payload 缓存，失败不会被缓存。"""
+    """拉取论文的引用 / 被引图谱。
+
+    失败时抛异常而不是返回 None：cache_data 不缓存异常，
+    否则一次限流就会让“无图”状态持续一小时。
+    """
     clean_id = get_pure_arxiv_id(arxiv_id)
     fields = (
         "paperId,title,year,citationCount,abstract,"
@@ -766,45 +799,32 @@ def fetch_graph_data(arxiv_id, ss_key=None):
         "citations.year,citations.abstract,citations.externalIds"
     )
     url = f"https://api.semanticscholar.org/graph/v1/paper/ArXiv:{clean_id}?fields={fields}"
-    last_err = None
     for attempt in range(3):
         try:
-            return _fetch_graph_payload(url, ss_key or "")
-        except Exception as e:
-            last_err = e
-            if attempt < 2:
-                time.sleep((attempt + 1) * 1.5)
-    st.session_state["ss_last_error"] = str(last_err)
-    return None
+            return _ss_get_json(url, ss_key or "", timeout=12)
+        except requests.RequestException as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            # 403 / 404 是鉴权失败或资源不存在，重试无意义
+            if status in (403, 404) or attempt == 2:
+                raise
+            time.sleep((attempt + 1) * 1.5)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_graph_payload(url: str, ss_key: str):
-    """只在成功时缓存；失败抛异常，避免把“取不到”缓存一小时。"""
-    headers = {"x-api-key": ss_key} if ss_key else {}
-    r = requests.get(url, headers=headers, timeout=12)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}")
-    return r.json()
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _search_ss_paper(clean_title: str, ss_key: str):
-    """只在成功时缓存；失败抛异常，避免“查不到”被缓存一小时。"""
-    url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={clean_title}&limit=1&fields=title,year,authors,citationCount,influentialCitationCount,tldr,venue"
-    headers = {"x-api-key": ss_key} if ss_key else {}
-    r = requests.get(url, headers=headers, timeout=5)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}")
-    data = r.json().get("data", [])
-    return data[0] if data else None
-
-
+@st.cache_data(ttl=3600)
 def fetch_ss_paper_details_by_title(title, ss_key=None):
+    """按标题查论文元数据（年份 / 作者 / 引用数 / TLDR / 期刊）。
+    查不到时返回 None：详情缺失只是少几个徽章，不影响问答流程。"""
+    clean_title = title.replace(".pdf", "").strip()
+    url = (
+        "https://api.semanticscholar.org/graph/v1/paper/search"
+        f"?query={clean_title}&limit=1"
+        "&fields=title,year,authors,citationCount,influentialCitationCount,tldr,venue"
+    )
     try:
-        return _search_ss_paper(title.replace(".pdf", "").strip(), ss_key or "")
-    except Exception:
+        data = _ss_get_json(url, ss_key or "", timeout=8).get("data", [])
+    except requests.RequestException:
         return None
+    return data[0] if data else None
 
 
 def get_one_line_contribution(abstract, title, api_key):
@@ -1081,10 +1101,8 @@ with st.sidebar:
     user_api_key = USER_API_KEY
     ss_api_key = SS_API_KEY
     st.success("🚀 高速调研模式已激活")
-    if ss_api_key:
-        st.caption("✅ Semantic Scholar 已配置（引用数 / 关联图谱可用）")
-    else:
-        st.caption("⚠️ 未配置 SS_API_KEY：引用数与关联图谱易受限流影响")
+    if not ss_api_key:
+        st.caption("⚠️ 未配置 SS_API_KEY，引用数与关联图谱可能受限流影响")
 
     cache_sz = len(st.session_state.citations_global_cache)
     if cache_sz:
@@ -1380,18 +1398,20 @@ with tab_main:
     if st.session_state.focus_paper_id:
         st.markdown('<div class="section-divider">📊 文献关联图谱</div>', unsafe_allow_html=True)
         min_cf = st.slider("最低引用数过滤", 0, 200, 5, step=1, key="graph_cite_filter")
+        graph_err = None
+        graph_status = None
         with st.spinner("加载图谱…"):
-            g_data = fetch_graph_data(st.session_state.focus_paper_id, ss_key=ss_api_key)
+            try:
+                g_data = fetch_graph_data(st.session_state.focus_paper_id, ss_key=ss_api_key)
+            except requests.RequestException as e:
+                g_data = None
+                graph_err = str(e)
+                graph_status = getattr(getattr(e, "response", None), "status_code", None)
 
         if not g_data:
-            err = st.session_state.get("ss_last_error") or "未知错误"
-            if not ss_api_key:
-                st.warning(
-                    "⚠️ 图谱加载失败：未配置 `SS_API_KEY`。Semantic Scholar 对匿名请求限流很严，"
-                    "建议在 Secrets 中配置后重试。"
-                )
-            else:
-                st.warning(f"⚠️ 暂时无法获取图谱（{err}），已自动重试 3 次，请稍后再试。")
+            st.warning(f"⚠️ 暂时无法获取图谱：{graph_err or '无数据'}")
+            if graph_status == 403:
+                st.info("403 表示 SS_API_KEY 已失效，请重新申请后填入 Secrets。")
         else:
             gc_graph, gc_info = st.columns([1.6, 1])
             with gc_graph:
