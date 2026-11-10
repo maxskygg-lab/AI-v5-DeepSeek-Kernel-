@@ -1394,8 +1394,8 @@ with tab_main:
             st.success(f"✅ 完成，找到 {len(st.session_state.search_results)} 篇")
             preload_top_graphs(st.session_state.search_results, ss_key=ss_api_key, top_n=3)
 
-    # ── 图谱区 ──
-    if st.session_state.focus_paper_id:
+    # ── 图谱区：聚焦论文在列表中时就地渲染（贴在论文卡片下方），否则回退到列表上方 ──
+    def render_graph_section():
         st.markdown('<div class="section-divider">📊 文献关联图谱</div>', unsafe_allow_html=True)
         min_cf = st.slider("最低引用数过滤", 0, 200, 5, step=1, key="graph_cite_filter")
         graph_err = None
@@ -1500,6 +1500,13 @@ with tab_main:
                             ← 点击左侧节点<br>查看完整详情</div>""",
                         unsafe_allow_html=True,
                     )
+
+    # 聚焦的论文不在当前检索列表里（例如点了图谱中的引用节点）时，图谱仍显示在列表上方
+    _focus_id = st.session_state.focus_paper_id
+    if _focus_id and not any(
+        item["obj"].entry_id == _focus_id for item in st.session_state.search_results
+    ):
+        render_graph_section()
 
     # ── 检索结果列表 ──
     if st.session_state.search_results:
@@ -1655,7 +1662,10 @@ with tab_main:
                 if cites is not None
                 else "<span class='cite-loading'>加载中…</span>"
             )
-            with st.expander(f"#{i+1} {res.title} ({res.published.year})"):
+            is_focused = st.session_state.focus_paper_id == res.entry_id
+            with st.expander(
+                f"#{i+1} {res.title} ({res.published.year})", expanded=is_focused
+            ):
                 sim_display = f" | 🎯 匹配度: {round(item.get('sim_score', 0), 1)}%"
                 st.markdown(
                     f"**{', '.join([a.name for a in res.authors])}** | "
@@ -1721,6 +1731,10 @@ with tab_main:
                     if st.button(lbl, key=f"graph_{i}"):
                         st.session_state.focus_paper_id = res.entry_id
                         st.rerun()
+
+                # 图谱直接渲染在这篇论文的卡片里，避免“论文在下面、图在上面”
+                if is_focused:
+                    render_graph_section()
 
     if st.session_state.search_generator:
         st.markdown("---")
