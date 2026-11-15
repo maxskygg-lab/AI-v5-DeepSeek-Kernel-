@@ -72,6 +72,13 @@ def _ns_vector_count(v):
     return int(getattr(v, "vector_count", 0) or 0)
 
 
+def _int_meta(value, default=0):
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def _list_namespace_ids(idx, ns):
     """版本兼容地列出 namespace 下全部向量 id（优先新版 list_paginated）。"""
     ids = []
@@ -175,6 +182,14 @@ def restore_topic_from_pinecone(topic_name, verbose=False):
                 files.append(sp)
 
         if docs:
+            # 云端返回顺序不稳定，按论文、页码、切片序号恢复文档顺序
+            docs.sort(
+                key=lambda d: (
+                    str(d.metadata.get("source_paper", "")),
+                    _int_meta(d.metadata.get("page")),
+                    _int_meta(d.metadata.get("chunk_index")),
+                )
+            )
             t["chunks"], t["files"] = docs, files
             t["db"] = get_vectorstore(ns)
             st.success(f"已从云端恢复 {len(files)} 篇论文、{len(docs)} 个切片。")
@@ -239,6 +254,8 @@ def migrate_legacy_namespaces(topic_name):
                 new_md = {"source_paper": sp, "topic": topic_name, "text": text}
                 if isinstance(md.get("page"), (int, float)):
                     new_md["page"] = int(md["page"])
+                if isinstance(md.get("chunk_index"), (int, float)):
+                    new_md["chunk_index"] = int(md["chunk_index"])
                 vals = getattr(v, "values", None)
                 if not vals:
                     continue

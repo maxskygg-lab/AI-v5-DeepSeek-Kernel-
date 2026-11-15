@@ -18,9 +18,13 @@ def test_rrf_respects_limit():
 
 
 class _Doc:
-    def __init__(self, text, paper):
+    def __init__(self, text, paper, page=0, chunk_index=0):
         self.page_content = text
-        self.metadata = {"source_paper": paper}
+        self.metadata = {
+            "source_paper": paper,
+            "page": page,
+            "chunk_index": chunk_index,
+        }
 
 
 def test_hybrid_retrieve_covers_multiple_papers(monkeypatch):
@@ -46,5 +50,38 @@ def test_hybrid_retrieve_covers_multiple_papers(monkeypatch):
     )
 
     sources = {d.metadata["source_paper"] for d in result}
-    assert len(result) == 5
+    assert len(result) == 6
     assert sources == {"paper0", "paper1", "paper2"}
+
+
+def test_select_representative_chunks_spreads_pages_and_skips_references():
+    docs = [
+        _Doc(
+            f"page {i} introduces method and reports results and conclusion",
+            "paper",
+            page=i,
+            chunk_index=i,
+        )
+        for i in range(30)
+    ]
+    docs[29] = _Doc(
+        "References\n[1] A. Author. 2020.\n[2] B. Author. 2021.\n[3] C. Author. 2022.",
+        "paper",
+        page=29,
+        chunk_index=29,
+    )
+
+    selected = retrieval.select_representative_chunks(docs, max_chunks=8)
+    pages = [d.metadata["page"] for d in selected]
+
+    assert len(selected) == 8
+    assert 0 in pages
+    assert 29 not in pages
+    assert max(pages) >= 20
+    assert len(set(pages)) >= 5
+
+
+def test_select_representative_chunks_returns_all_when_small():
+    docs = [_Doc(f"text {i}", "paper", page=i, chunk_index=i) for i in range(3)]
+
+    assert len(retrieval.select_representative_chunks(docs, max_chunks=8)) == 3

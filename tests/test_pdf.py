@@ -15,6 +15,22 @@ def test_has_extractable_text():
     assert pdf.has_extractable_text([_Doc("正文")])
 
 
+def test_merge_fitz_fallback_replaces_short_pages():
+    class _Page:
+        def __init__(self, text, page):
+            self.page_content = text
+            self.metadata = {"page": page}
+
+    pypdf_docs = [_Page("", 0), _Page("short", 1), _Page("full text " * 50, 2)]
+    fitz_docs = [_Page("recovered page zero " * 20, 0), _Page("recovered page one " * 20, 1)]
+
+    merged = pdf._merge_fitz_fallback(pypdf_docs, fitz_docs)
+
+    assert "recovered page zero" in merged[0].page_content
+    assert "recovered page one" in merged[1].page_content
+    assert merged[2] is pypdf_docs[2]
+
+
 def test_process_rejects_pdf_without_text(fake_state, monkeypatch):
     fake_state["active_topic"] = "topic"
     fake_state["topics"] = {"topic": {"files": [], "chunks": [], "db": None}}

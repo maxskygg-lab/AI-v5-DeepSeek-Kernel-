@@ -59,6 +59,39 @@ def _extract_text_with_fitz(file_path, file_name, topic_name):
     return docs
 
 
+def _page_of_doc(doc, default=0):
+    try:
+        return int(doc.metadata.get("page", default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _merge_fitz_fallback(docs, fitz_docs, min_chars=200):
+    """用 PyMuPDF 的页面文本补齐 PyPDF 提取过短的页面。"""
+    if not fitz_docs:
+        return docs
+    by_page = {_page_of_doc(d): d for d in fitz_docs}
+    merged = []
+    for index, doc in enumerate(docs):
+        page = _page_of_doc(doc, index)
+        alt = by_page.get(page)
+        if (
+            alt
+            and len(doc.page_content.strip()) < min_chars
+            and len(alt.page_content.strip()) > len(doc.page_content.strip())
+        ):
+            merged.append(alt)
+        else:
+            merged.append(doc)
+
+    known_pages = {_page_of_doc(d, i) for i, d in enumerate(merged)}
+    for alt in fitz_docs:
+        if _page_of_doc(alt) not in known_pages:
+            merged.append(alt)
+    merged.sort(key=lambda d: _page_of_doc(d))
+    return merged
+
+
 def load_pdf_documents(file_path, file_name, topic_name):
     from langchain_community.document_loaders import PyPDFLoader
 
@@ -67,7 +100,22 @@ def load_pdf_documents(file_path, file_name, topic_name):
     for doc in docs:
         doc.metadata["source_paper"] = file_name
         doc.metadata["topic"] = topic_name
-    # 若 pypdf 未能提取文字（如扫描版 PDF），回退到 PyMuPDF
+
+    total_pages = len(docs)
+    nonempty_pages = sum(1 for doc in docs if doc.page_content.strip())
+    # pypdf 只抽出少量页面时（如大部分页面解析失败），用 PyMuPDF 补齐
+    if total_pages and nonempty_pages / total_pages < 0.6:
+        logger.info(
+            "pdf_text_coverage_low file=%s pages=%d nonempty=%d",
+            file_name,
+            total_pages,
+            nonempty_pages,
+        )
+        docs = _merge_fitz_fallback(
+            docs, _extract_text_with_fitz(file_path, file_name, topic_name)
+        )
+
+    # 若 pypdf 完全未能提取文字（如扫描版 PDF），回退到 PyMuPDF
     if not has_extractable_text(docs):
         docs = _extract_text_with_fitz(file_path, file_name, topic_name)
     return docs
@@ -79,7 +127,13 @@ def split_documents(docs):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=600, chunk_overlap=200, separators=["\n\n", "\n", "。", ".", " ", ""]
     )
-    return [c for c in splitter.split_documents(docs) if len(c.page_content.strip()) > MIN_CHUNK_CHARS]
+    chunks = []
+    for index, chunk in enumerate(splitter.split_documents(docs)):
+        if len(chunk.page_content.strip()) <= MIN_CHUNK_CHARS:
+            continue
+        chunk.metadata["chunk_index"] = index
+        chunks.append(chunk)
+    return chunks
 
 
 def process_and_add_to_topic(file_path, file_name, api_key, topic_name=None):

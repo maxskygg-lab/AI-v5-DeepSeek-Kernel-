@@ -1,6 +1,7 @@
 """混合检索：BM25 + Dense → RRF 融合 → Cross-Encoder 重排。"""
 
 import hashlib
+import re
 import time
 
 import numpy as np
@@ -10,6 +11,110 @@ from .embeddings import get_cross_encoder
 from .log import get_logger
 
 logger = get_logger("retrieval")
+
+_REF_HEADING_RE = re.compile(r"(?im)^\s*(references|bibliography|参考文献)\s*$")
+_CITATION_RE = re.compile(
+    r"\[\d{1,3}\]|\(\d{4}\)|et al\.|arxiv:\s*\d{4}\.\d{4,5}|doi:\s*10\.", re.I
+)
+_SECTION_WEIGHTS = (
+    ("conclusion", 6),
+    ("limitation", 5),
+    ("future work", 3),
+    ("result", 4),
+    ("experiment", 3),
+    ("evaluation", 3),
+    ("ablation", 3),
+    ("abstract", 3),
+    ("method", 2),
+    ("approach", 2),
+    ("references", -20),
+    ("bibliography", -20),
+    ("appendix", -2),
+)
+
+
+def _as_int(value, default=0):
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _page_of(doc):
+    return _as_int(doc.metadata.get("page"), 0)
+
+
+def _chunk_index_of(doc):
+    return _as_int(doc.metadata.get("chunk_index"), 0)
+
+
+def _order_key(doc):
+    return (_page_of(doc), _chunk_index_of(doc), doc.page_content[:40])
+
+
+def _section_score(doc):
+    text = doc.page_content.lower()
+    return sum(weight for keyword, weight in _SECTION_WEIGHTS if keyword in text)
+
+
+def _is_reference_chunk(doc, max_page):
+    """识别参考文献页，避免把上下文全喂成引用列表。"""
+    text = doc.page_content
+    if _REF_HEADING_RE.search(text[:400]):
+        return True
+    if max_page and _page_of(doc) >= max_page * 0.6:
+        if len(_CITATION_RE.findall(text)) >= 8:
+            return True
+    return False
+
+
+def select_representative_chunks(chunks, max_chunks=15, exclude_references=True):
+    """按页均匀抽样，优先覆盖摘要、方法、结果与结论。"""
+    if not chunks:
+        return []
+
+    unique = {}
+    for chunk in chunks:
+        digest = hashlib.sha1(chunk.page_content.encode("utf-8")).hexdigest()
+        unique.setdefault(digest, chunk)
+    items = list(unique.values())
+    max_page = max((_page_of(c) for c in items), default=0)
+
+    if exclude_references:
+        filtered = [c for c in items if not _is_reference_chunk(c, max_page)]
+        if filtered:
+            items = filtered
+
+    items.sort(key=_order_key)
+    if len(items) <= max_chunks:
+        return items
+
+    selected, chosen = [], set()
+
+    def add(chunk):
+        digest = hashlib.sha1(chunk.page_content.encode("utf-8")).hexdigest()
+        if digest not in chosen and len(selected) < max_chunks:
+            selected.append(chunk)
+            chosen.add(digest)
+
+    add(items[0])  # 标题/摘要
+    tail_start = max(0, int(len(items) * 0.75))
+    tail = sorted(items[tail_start:], key=_section_score, reverse=True)
+    if tail:
+        add(tail[0])  # 结论/讨论优先
+
+    slots = max_chunks - len(selected)
+    if slots > 0:
+        step = len(items) / slots
+        for i in range(slots):
+            add(items[min(len(items) - 1, int((i + 0.5) * step))])
+
+    if len(selected) < max_chunks:
+        for chunk in sorted(items, key=_section_score, reverse=True):
+            add(chunk)
+
+    selected.sort(key=_order_key)
+    return selected
 
 
 def get_bm25(target_chunks, cache_key):
@@ -69,35 +174,62 @@ def hybrid_retrieve(query, target_chunks, db, search_kwargs, cache_key, cross_pa
     candidate_docs = [text_to_doc[txt] for txt in candidate_texts if txt in text_to_doc]
 
     cross_encoder = get_cross_encoder()
-    cross_scores = cross_encoder.predict([[query, d.page_content] for d in candidate_docs])
+    cross_scores = np.asarray(
+        cross_encoder.predict([[query, d.page_content] for d in candidate_docs]), dtype=float
+    )
+    max_page = max((_page_of(d) for d in candidate_docs), default=0)
+    if cross_paper:
+        # 参考文献页在对比场景几乎没有信息量，降权而不是直接丢弃
+        for i, doc in enumerate(candidate_docs):
+            if _is_reference_chunk(doc, max_page):
+                cross_scores[i] -= 10.0
+
     top_cross_indices = np.argsort(cross_scores)[::-1]
     docs, chosen = [], set()
+    paper_count = 0
 
     if cross_paper:
-        seen_papers = set()
-        # 第一轮：每篇论文只保留最高分的一个块，保证跨论文覆盖
+        paper_count = len({d.metadata.get("source_paper", "未知") for d in candidate_docs})
+        per_paper = 6 if paper_count <= 2 else 4
+        max_docs = min(20, max(paper_count, per_paper * paper_count))
+        quotas = {}
+
+        # 第一轮：每篇论文先取 1 段，保证所有论文都被覆盖
         for i in top_cross_indices:
-            if len(docs) >= 5:
+            if len(docs) >= max_docs:
                 break
             d = candidate_docs[i]
             src = d.metadata.get("source_paper", "未知")
-            if src in seen_papers:
+            if src in quotas:
                 continue
-            seen_papers.add(src)
             docs.append(d)
+            quotas[src] = 1
             chosen.add(i)
-        # 第二轮：候选覆盖的论文不足 5 篇时，用剩余高分块补齐
+
+        # 第二轮：按每篇配额补齐，让每篇都有摘要/方法/结果/结论多段
         for i in top_cross_indices:
-            if len(docs) >= 5:
+            if len(docs) >= max_docs:
                 break
-            if i not in chosen:
-                docs.append(candidate_docs[i])
-                chosen.add(i)
+            if i in chosen:
+                continue
+            d = candidate_docs[i]
+            src = d.metadata.get("source_paper", "未知")
+            if quotas.get(src, 0) >= per_paper:
+                continue
+            if _is_reference_chunk(d, max_page):
+                continue
+            docs.append(d)
+            quotas[src] = quotas.get(src, 0) + 1
+            chosen.add(i)
+
+        docs.sort(key=lambda d: (str(d.metadata.get("source_paper", "")), _order_key(d)))
     else:
         docs = [candidate_docs[i] for i in top_cross_indices[:5]]
     logger.debug(
-        "hybrid_retrieve cross_paper=%s chunks=%d candidates=%d selected=%d elapsed_ms=%.0f",
+        "hybrid_retrieve cross_paper=%s papers=%d chunks=%d candidates=%d selected=%d "
+        "elapsed_ms=%.0f",
         cross_paper,
+        paper_count,
         len(target_chunks),
         len(candidate_docs),
         len(docs),
