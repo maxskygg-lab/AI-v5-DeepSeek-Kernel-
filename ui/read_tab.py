@@ -1,11 +1,18 @@
 """Tab 2：研读空间（单篇精读 / 多篇对比 / 自由问答）。"""
 
+import hashlib
 import uuid
 from datetime import datetime
 
 import streamlit as st
 
-from services.context import format_digests, get_paper_digests, strip_overlap
+from services.context import (
+    cited_page_coverage,
+    collect_cited_chunks,
+    format_digests,
+    get_paper_digests,
+    strip_overlap,
+)
 from services.llm import get_deepseek_llm
 from services.log import get_logger
 from services.notes import save_note_to_cloud
@@ -89,6 +96,33 @@ def render_read_tab(user_api_key, ss_api_key):
                         st.caption("📎 本次抽取覆盖：" + "；".join(coverage))
                         digest_text = format_digests(digests)
 
+                        # 按摘要引用页码回取原文，保证综述里的页码有原文可核对
+                        cited_lines = []
+                        for p in matrix_papers:
+                            digest = digests[p].get("digest", "")
+                            cited = collect_cited_chunks(
+                                p,
+                                t["chunks"],
+                                digest,
+                                max_chunks=10 if len(matrix_papers) <= 3 else 6,
+                            )
+                            if cited:
+                                cited_lines.append(f"【{p}】")
+                                for d in cited:
+                                    page = int(d.metadata.get("page", 0) or 0) + 1
+                                    text = d.page_content.replace("\n", " ").strip()
+                                    cited_lines.append(f"[P{page}] {text}")
+                            _, _, missing = cited_page_coverage(
+                                [c for c in t["chunks"] if c.metadata.get("source_paper") == p],
+                                digest,
+                            )
+                            if missing:
+                                st.warning(
+                                    f"《{p}》摘要引用了 P{'、P'.join(map(str, missing))}，"
+                                    "但原文索引中没有这些页，无法提供原文核对。"
+                                )
+                        cited_text = "\n".join(cited_lines)
+
                         # 步骤 2：调用大模型进行信息整合与综述
                         llm = get_deepseek_llm(user_api_key, temperature=0.1)
                         matrix_prompt = (
@@ -104,7 +138,9 @@ def render_read_tab(user_api_key, ss_api_key):
                             "梳理这些文献的研究方法演进与优劣势。\n"
                             "**【致命要求】**：综述中的每一条结论，必须使用摘要中真实出现的页码进行引用溯源。"
                             "格式例如：`（《某文献名》[P页码]）`。绝对禁止编造任何未在资料中出现的虚假指标或事实。\n\n"
-                            f"### 论文结构化摘要（仅以此为准）：\n{digest_text}"
+                            f"### 论文结构化摘要（仅以此为准）：\n{digest_text}\n\n"
+                            f"### 摘要引用页原文（用于核对页码与指标）：\n"
+                            f"{cited_text or '（无）'}"
                         )
 
                         res_matrix = llm.invoke(matrix_prompt)
@@ -243,26 +279,61 @@ def render_read_tab(user_api_key, ss_api_key):
                         logger.warning("digest_generation_fallback error=%s", digest_err)
                         digests = {}
 
+                    # 步骤 3：按摘要引用页码回取原文，避免“摘要说有、证据里没有”
+                    cited_docs = []
+                    if digests:
+                        for p in digest_papers:
+                            digest = digests.get(p, {}).get("digest", "")
+                            cited_docs.extend(
+                                collect_cited_chunks(
+                                    p,
+                                    t["chunks"],
+                                    digest,
+                                    max_chunks=12 if len(digest_papers) <= 2 else 8,
+                                )
+                            )
+                            _, _, missing = cited_page_coverage(
+                                [c for c in t["chunks"] if c.metadata.get("source_paper") == p],
+                                digest,
+                            )
+                            if missing:
+                                st.warning(
+                                    f"《{p}》摘要引用了 P{'、P'.join(map(str, missing))}，"
+                                    "但原文索引中没有这些页，无法提供原文核对。"
+                                )
+
                 # --- 核心优化 B：构建更智能的 Prompt ---
-                if not docs:
+                if not docs and not cited_docs:
                     full_response = "⚠️ 未在文档中利用混合管线检索到相关信息，请尝试更换关键词。"
                     message_placeholder.markdown(full_response)
                 else:
                     digest_text = format_digests(digests)
-                    # 按论文/页码/切片排序，并去掉 chunk_overlap 造成的重复文本
-                    ordered_docs = sorted(
-                        docs,
+                    # 合并“摘要引用页证据”与“问题检索证据”，按论文/页码/切片排序
+                    cited_keys = {
+                        hashlib.sha1(d.page_content.encode("utf-8")).hexdigest()
+                        for d in cited_docs
+                    }
+                    all_docs = []
+                    seen = set()
+                    for d in cited_docs + docs:
+                        key = hashlib.sha1(d.page_content.encode("utf-8")).hexdigest()
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        all_docs.append(d)
+                    all_docs.sort(
                         key=lambda d: (
                             str(d.metadata.get("source_paper", "")),
                             int(d.metadata.get("page", 0) or 0),
                             int(d.metadata.get("chunk_index", 0) or 0),
-                        ),
+                        )
                     )
+
                     context_text = ""
                     refs = []
                     previous_by_paper = {}
                     ref_no = 0
-                    for d in ordered_docs:
+                    for d in all_docs:
                         src = d.metadata.get("source_paper", "未知")
                         page = int(d.metadata.get("page", 0) or 0) + 1  # PyPDFLoader通常从0开始
                         raw = d.page_content.replace("\n", " ").strip()
@@ -271,8 +342,10 @@ def render_read_tab(user_api_key, ss_api_key):
                         if not snippet:
                             continue
                         ref_no += 1
-                        context_text += f"[资料{ref_no} | {src} (P{page})]: {snippet}\n\n"
-                        refs.append(f"**[{ref_no}] {src} (P{page})**: {snippet[:100]}...")
+                        key = hashlib.sha1(d.page_content.encode("utf-8")).hexdigest()
+                        tag = "摘要证据" if key in cited_keys else "检索证据"
+                        context_text += f"[资料{ref_no} | {tag} | {src} (P{page})]: {snippet}\n\n"
+                        refs.append(f"**[{ref_no}] {tag} | {src} (P{page})**: {snippet[:100]}...")
 
                     ss_context = ""
                     if ss_data:
@@ -301,7 +374,9 @@ def render_read_tab(user_api_key, ss_api_key):
                             "1. 先用结构化摘要建立整体理解，再用原文片段回答具体问题。\n"
                             "2. 回答要深入、具体，多引用数据或具体算法步骤。\n"
                             "3. 如果资料中包含公式描述，请还原为 LaTeX 格式。\n"
-                            "4. 引用时给出页码，严禁编造资料中不存在的内容。"
+                            "4. 引用时给出页码，严禁编造资料中不存在的内容。\n"
+                            "5. 证据标签中「摘要证据」是摘要引用页的原文，"
+                            "「检索证据」是与问题最相关的原文；回答具体结论时优先用摘要证据核对页码。"
                             f"{ss_context}"
                             f"\n\n### 论文结构化摘要：\n{digest_text}"
                         )
@@ -313,7 +388,9 @@ def render_read_tab(user_api_key, ss_api_key):
                             "1. 先用结构化摘要建立每篇论文的整体理解，再用原文证据回答具体问题。\n"
                             "2. 必须明确指出不同观点分别来自哪篇论文，并给出页码。\n"
                             "3. 如果涉及对比，请使用 Markdown 表格形式展示。\n"
-                            "4. 摘要中标注“资料未覆盖”的字段，不要臆测。"
+                            "4. 摘要中标注“资料未覆盖”的字段，不要臆测。\n"
+                            "5. 「摘要证据」是摘要引用页的原文，「检索证据」是与问题最相关的原文；"
+                            "两者都没有原文时，明确写「检索证据未覆盖」。"
                             f"\n\n### 论文结构化摘要：\n{digest_text}"
                         )
 

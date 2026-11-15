@@ -1,6 +1,7 @@
 """按论文构建结构化摘要，作为对比/综述与跨论文问答的上下文层。"""
 
 import hashlib
+import re
 
 import streamlit as st
 
@@ -19,6 +20,136 @@ def _page(chunk):
         return int(chunk.metadata.get("page", 0) or 0) + 1
     except (TypeError, ValueError):
         return 1
+
+
+def _chunk_index(chunk):
+    try:
+        return int(chunk.metadata.get("chunk_index", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+_CITE_PATTERNS = (
+    re.compile(r"P\s*(\d{1,3})", re.I),
+    re.compile(r"第\s*(\d{1,3})\s*页"),
+    re.compile(r"page\s*(\d{1,3})", re.I),
+)
+
+
+def _pages_in_text(text):
+    pages = []
+    for pattern in _CITE_PATTERNS:
+        for raw in pattern.findall(text):
+            page = int(raw)
+            if page not in pages:
+                pages.append(page)
+    return pages
+
+
+_WORD_RE = re.compile(r"[a-z][a-z0-9\-\.]*", re.I)
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+
+
+def _tokens(text):
+    text = (text or "").lower()
+    tokens = set(_WORD_RE.findall(text))
+    for block in _CJK_RE.findall(text):
+        if len(block) == 1:
+            tokens.add(block)
+        else:
+            tokens.update(block[i : i + 2] for i in range(len(block) - 1))
+    return tokens
+
+
+def _citation_queries(digest):
+    """返回 {页码: 摘要中该页的引用上下文}，关键证据优先。"""
+    queries = {}
+    key_section = ""
+    match = re.search(r"#{2,4}\s*关键证据(.*)$", digest, re.S)
+    if match:
+        key_section = match.group(1)
+    for text in (key_section, digest):
+        for line in text.splitlines():
+            pages = _pages_in_text(line)
+            if not pages:
+                continue
+            for page in pages:
+                queries.setdefault(page, line.strip())
+    return queries
+
+
+def _score_chunk(query_tokens, chunk):
+    if not query_tokens:
+        return 0
+    return len(query_tokens & _tokens(chunk.page_content))
+
+
+def extract_cited_pages(digest, limit=12):
+    """从摘要中提取引用页码，优先解析“关键证据”段。"""
+    if not digest:
+        return []
+    key_section = ""
+    match = re.search(r"#{2,4}\s*关键证据(.*)$", digest, re.S)
+    if match:
+        key_section = match.group(1)
+    pages = []
+    for text in (key_section, digest):
+        for page in _pages_in_text(text):
+            if page not in pages:
+                pages.append(page)
+        if len(pages) >= limit:
+            break
+    return pages[:limit]
+
+
+def collect_cited_chunks(paper, chunks, digest, max_chunks=8, max_per_page=2):
+    """按摘要引用页码取回原文，保证页码引用有原文可核对。"""
+    paper_chunks = [c for c in chunks if c.metadata.get("source_paper") == paper]
+    cited_pages = extract_cited_pages(digest, limit=max_chunks)
+    if not cited_pages:
+        return select_representative_chunks(paper_chunks, max_chunks=min(6, max_chunks))
+
+    by_page = {}
+    for chunk in paper_chunks:
+        page = _page(chunk)
+        if page in cited_pages:
+            by_page.setdefault(page, []).append(chunk)
+
+    cites = _citation_queries(digest)
+
+    def ranked(page):
+        query_tokens = _tokens(cites.get(page, ""))
+        return sorted(
+            by_page.get(page, []),
+            key=lambda c: (-_score_chunk(query_tokens, c), _chunk_index(c)),
+        )
+
+    result = []
+    # 先保证每个引用页至少一段，再补同页的第二段
+    for page in cited_pages:
+        page_chunks = ranked(page)
+        if page_chunks and len(result) < max_chunks:
+            result.append(page_chunks[0])
+    for page in cited_pages:
+        page_chunks = ranked(page)
+        for chunk in page_chunks[1:max_per_page]:
+            if len(result) >= max_chunks:
+                break
+            result.append(chunk)
+        if len(result) >= max_chunks:
+            break
+    if not result:
+        return select_representative_chunks(paper_chunks, max_chunks=min(6, max_chunks))
+    result.sort(key=lambda c: (_page(c), _chunk_index(c)))
+    return result[:max_chunks]
+
+
+def cited_page_coverage(chunks, digest):
+    """返回 (引用页数, 有原文的页数, 缺失页列表)。"""
+    cited = set(extract_cited_pages(digest))
+    available = {_page(c) for c in chunks}
+    missing = sorted(cited - available)
+    return len(cited), len(cited & available), missing
 
 
 def strip_overlap(previous, current, min_overlap=80, max_overlap=400):
