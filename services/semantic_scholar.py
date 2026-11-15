@@ -163,7 +163,7 @@ def fetch_graph_data(arxiv_id, ss_key=None):
 
 
 @st.cache_data(ttl=3600)
-def fetch_ss_paper_details_by_title(title, ss_key=None):
+def fetch_ss_paper_details_by_title(title, ss_key=None, timeout=8):
     """按标题查论文元数据（年份 / 作者 / 引用数 / TLDR / 期刊）。
     查不到时返回 None：详情缺失只是少几个徽章，不影响问答流程。"""
     clean_title = title.replace(".pdf", "").strip()
@@ -173,7 +173,7 @@ def fetch_ss_paper_details_by_title(title, ss_key=None):
         "&fields=title,year,authors,citationCount,influentialCitationCount,tldr,venue"
     )
     try:
-        data = _ss_get_json(url, ss_key or "", timeout=8).get("data", [])
+        data = _ss_get_json(url, ss_key or "", timeout=timeout).get("data", [])
     except requests.RequestException as e:
         logger.debug("paper_details_unavailable title=%s error=%s", clean_title[:60], e)
         return None

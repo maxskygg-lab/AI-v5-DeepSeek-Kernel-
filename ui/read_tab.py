@@ -5,10 +5,11 @@ from datetime import datetime
 
 import streamlit as st
 
+from services.context import format_digests, get_paper_digests, strip_overlap
 from services.llm import get_deepseek_llm
 from services.log import get_logger
 from services.notes import save_note_to_cloud
-from services.retrieval import hybrid_retrieve, select_representative_chunks
+from services.retrieval import hybrid_retrieve
 from services.semantic_scholar import fetch_ss_paper_details_by_title
 from services.vectorstore import active_topic_data
 
@@ -56,53 +57,54 @@ def render_read_tab(user_api_key, ss_api_key):
                     "🧠 正在提取文献片段，构建对比矩阵及追溯综述初稿（这可能需要一些时间，请耐心等待）..."
                 ):
                     try:
-                        # 步骤 1：按页均匀抽样，覆盖摘要、方法、结果与结论，避免只取到参考文献
-                        per_paper_limit = 15 if len(matrix_papers) <= 3 else 10
-                        refs_text = ""
+                        # 步骤 1：为每篇论文生成结构化摘要（基于全文代表性片段，缓存复用）
+                        with st.spinner("正在生成每篇论文的结构化摘要（首次较慢，之后会缓存）..."):
+                            digests = get_paper_digests(
+                                matrix_papers,
+                                t["chunks"],
+                                user_api_key,
+                                ss_api_key,
+                                with_meta=True,
+                            )
                         coverage = []
                         for p in matrix_papers:
-                            p_chunks = select_representative_chunks(
-                                [c for c in t["chunks"] if c.metadata.get("source_paper") == p],
-                                max_chunks=per_paper_limit,
-                            )
-                            if p_chunks:
-                                pages = sorted(
-                                    {int(c.metadata.get("page", 0) or 0) + 1 for c in p_chunks}
-                                )
+                            info = digests[p]
+                            pages = info.get("pages") or []
+                            if pages:
                                 coverage.append(
-                                    f"{p}：{len(p_chunks)} 段（P{pages[0]}–P{pages[-1]}）"
+                                    f"{p}：{info.get('chunk_count', 0)} 段（P{pages[0]}–P{pages[-1]}）"
                                 )
-                                if len(p_chunks) < 5:
+                                if info.get("chunk_count", 0) < 5:
                                     st.warning(
-                                        f"《{p}》仅提取到 {len(p_chunks)} 个片段"
+                                        f"《{p}》仅提取到 {info.get('chunk_count', 0)} 个片段"
                                         f"（P{pages[0]}–P{pages[-1]}），矩阵可能不完整；"
                                         "建议重新上传文本版 PDF 或先做 OCR。"
                                     )
                             else:
                                 coverage.append(f"{p}：0 段")
-                            refs_text += f"\n\n【文献：{p}】\n"
-                            if not p_chunks:
-                                refs_text += "（没有可用片段，可能是扫描版或解析失败）\n"
-                            for c in p_chunks:
-                                page_num = int(c.metadata.get("page", 0) or 0) + 1
-                                chunk_no = c.metadata.get("chunk_index")
-                                label = f"P{page_num}"
-                                if chunk_no is not None:
-                                    label += f" | 片段{int(chunk_no) + 1}"
-                                refs_text += f"[{label}] {c.page_content}\n"
+                                st.warning(
+                                    f"《{p}》没有可用片段，无法生成完整矩阵；"
+                                    "请确认论文已入库，或重新上传文本版 PDF。"
+                                )
                         st.caption("📎 本次抽取覆盖：" + "；".join(coverage))
+                        digest_text = format_digests(digests)
 
                         # 步骤 2：调用大模型进行信息整合与综述
                         llm = get_deepseek_llm(user_api_key, temperature=0.1)
                         matrix_prompt = (
-                            "你是一位资深的AI顶会审稿人与学术研究员。请仔细阅读以下提供的多篇论文原文片段，完成以下两项任务：\n\n"
+                            "你是一位资深的AI顶会审稿人与学术研究员。请仔细阅读以下每篇论文的结构化摘要"
+                            "（由全文代表性片段抽取，含页码证据），完成以下两项任务：\n\n"
                             "### 任务一：结构化对比矩阵 (Markdown Table)\n"
-                            "请严格提取各论文的核心特征，输出一个对比表格，**表头必须且只能包含以下五列：论文名称、创新点、基准数据集、SOTA 指标、局限性**。若所给片段确实未包含某一项，请填写“未明确提及”，不要臆测。\n\n"
+                            "请严格提取各论文的核心特征，输出一个对比表格，**表头必须且只能包含以下五列："
+                            "论文名称、创新点、基准数据集、SOTA 指标、局限性**。"
+                            "优先使用结构化摘要中的字段；若摘要标注“资料未覆盖”，再结合关键证据判断；"
+                            "确实没有才填写“未明确提及”，不要臆测。\n\n"
                             "### 任务二：带溯源的学术综述初稿\n"
-                            "基于上述表格和原文片段的逻辑脉络，撰写一段连贯的学术综述（约400-500字），梳理这些文献的研究方法演进与优劣势。"
-                            "提供的片段已覆盖每篇论文的摘要、方法、实验/结果与结论；请先在各篇论文内部综合这些片段，再做横向对比。\n"
-                            "**【致命要求】**：综述中的每一条结论，必须严格使用真实的原文页码与片段序号进行引用溯源。格式例如：`（《某文献名》[P页码|片段X]）`。绝对禁止大模型编造任何未在资料中出现的虚假指标或事实。\n\n"
-                            f"### 论文资料库（仅以此为准）：\n{refs_text}"
+                            "基于上述摘要与关键证据，撰写一段连贯的学术综述（约400-500字），"
+                            "梳理这些文献的研究方法演进与优劣势。\n"
+                            "**【致命要求】**：综述中的每一条结论，必须使用摘要中真实出现的页码进行引用溯源。"
+                            "格式例如：`（《某文献名》[P页码]）`。绝对禁止编造任何未在资料中出现的虚假指标或事实。\n\n"
+                            f"### 论文结构化摘要（仅以此为准）：\n{digest_text}"
                         )
 
                         res_matrix = llm.invoke(matrix_prompt)
@@ -178,10 +180,10 @@ def render_read_tab(user_api_key, ss_api_key):
                 if selected_scope != "🌐 全库综合 (对比/综述)":
                     filter_rule = {"source_paper": selected_scope}
                     search_kwargs = {"k": 20, "filter": filter_rule}
-                    status_text = f"🔍 正在运用混合检索管线深度扫描论文《{selected_scope}》..."
+                    status_text = f"🔍 正在生成论文摘要并深度扫描论文《{selected_scope}》..."
                 else:
                     search_kwargs = {"k": 15, "fetch_k": 50, "lambda_mult": 0.6}
-                    status_text = f"🔍 正在运用混合检索管线全库 {len(t['files'])} 篇论文中检索..."
+                    status_text = f"🔍 正在生成论文摘要并在全库 {len(t['files'])} 篇论文中检索..."
 
                 with st.spinner(status_text):
                     try:
@@ -223,20 +225,54 @@ def render_read_tab(user_api_key, ss_api_key):
                             docs = t["db"].max_marginal_relevance_search(prompt, **search_kwargs)
                             ss_data = None
 
+                    # 步骤 2：生成每篇论文的结构化摘要（缓存复用）
+                    digest_papers = (
+                        [selected_scope]
+                        if selected_scope != "🌐 全库综合 (对比/综述)"
+                        else t["files"]
+                    )
+                    try:
+                        digests = get_paper_digests(
+                            digest_papers,
+                            t["chunks"],
+                            user_api_key,
+                            ss_api_key,
+                            with_meta=True,
+                        )
+                    except Exception as digest_err:
+                        logger.warning("digest_generation_fallback error=%s", digest_err)
+                        digests = {}
+
                 # --- 核心优化 B：构建更智能的 Prompt ---
                 if not docs:
                     full_response = "⚠️ 未在文档中利用混合管线检索到相关信息，请尝试更换关键词。"
                     message_placeholder.markdown(full_response)
                 else:
-                    # 整理上下文，带上来源标记
+                    digest_text = format_digests(digests)
+                    # 按论文/页码/切片排序，并去掉 chunk_overlap 造成的重复文本
+                    ordered_docs = sorted(
+                        docs,
+                        key=lambda d: (
+                            str(d.metadata.get("source_paper", "")),
+                            int(d.metadata.get("page", 0) or 0),
+                            int(d.metadata.get("chunk_index", 0) or 0),
+                        ),
+                    )
                     context_text = ""
                     refs = []
-                    for i, d in enumerate(docs):
+                    previous_by_paper = {}
+                    ref_no = 0
+                    for d in ordered_docs:
                         src = d.metadata.get("source_paper", "未知")
-                        page = d.metadata.get("page", 0) + 1  # PyPDFLoader通常从0开始
-                        snippet = d.page_content.replace("\n", " ")
-                        context_text += f"[资料{i+1} | {src} (P{page})]: {snippet}\n\n"
-                        refs.append(f"**[{i+1}] {src} (P{page})**: {snippet[:100]}...")
+                        page = int(d.metadata.get("page", 0) or 0) + 1  # PyPDFLoader通常从0开始
+                        raw = d.page_content.replace("\n", " ").strip()
+                        snippet = strip_overlap(previous_by_paper.get(src, ""), raw)
+                        previous_by_paper[src] = raw
+                        if not snippet:
+                            continue
+                        ref_no += 1
+                        context_text += f"[资料{ref_no} | {src} (P{page})]: {snippet}\n\n"
+                        refs.append(f"**[{ref_no}] {src} (P{page})**: {snippet[:100]}...")
 
                     ss_context = ""
                     if ss_data:
@@ -260,20 +296,25 @@ def render_read_tab(user_api_key, ss_api_key):
                     if selected_scope != "🌐 全库综合 (对比/综述)":
                         sys_prompt = (
                             f"你正在辅助用户精读论文《{selected_scope}》。\n"
-                            "请利用提供的[资料片段]回答问题。\n"
+                            "以下有该论文的结构化摘要（基于全文代表性片段）和与问题相关的原文片段。\n"
                             "要求：\n"
-                            "1. 回答要深入、具体，多引用数据或具体算法步骤。\n"
-                            "2. 如果资料中包含公式描述，请还原为 LaTeX 格式。\n"
-                            "3. 严禁编造资料中不存在的内容。"
+                            "1. 先用结构化摘要建立整体理解，再用原文片段回答具体问题。\n"
+                            "2. 回答要深入、具体，多引用数据或具体算法步骤。\n"
+                            "3. 如果资料中包含公式描述，请还原为 LaTeX 格式。\n"
+                            "4. 引用时给出页码，严禁编造资料中不存在的内容。"
                             f"{ss_context}"
+                            f"\n\n### 论文结构化摘要：\n{digest_text}"
                         )
                     else:
                         sys_prompt = (
-                            "你是一名学术顾问。请综合提供的多篇论文资料回答问题。\n"
+                            "你是一名学术顾问。以下有每篇论文的结构化摘要"
+                            "（基于全文代表性片段）和与问题相关的原文证据。\n"
                             "要求：\n"
-                            "1. 必须明确指出不同观点分别来自哪篇论文（如：‘Paper A 提出了...而 Paper B 则认为...’）。\n"
-                            "2. 如果涉及对比，请使用 Markdown 表格形式展示。\n"
-                            "3. 保持客观中立。"
+                            "1. 先用结构化摘要建立每篇论文的整体理解，再用原文证据回答具体问题。\n"
+                            "2. 必须明确指出不同观点分别来自哪篇论文，并给出页码。\n"
+                            "3. 如果涉及对比，请使用 Markdown 表格形式展示。\n"
+                            "4. 摘要中标注“资料未覆盖”的字段，不要臆测。"
+                            f"\n\n### 论文结构化摘要：\n{digest_text}"
                         )
 
                     # --- 核心优化 C：调用 DeepSeek (流式) ---

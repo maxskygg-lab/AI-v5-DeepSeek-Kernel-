@@ -54,6 +54,7 @@ defaults = {
     "notes_unsynced": [],  # 尚未成功写入云端、待重试的笔记
     "notes_last_error": None,
     "preload_done_ids": set(),
+    "paper_digests": {},
 }
 for k, v in defaults.items():
     if k not in st.session_state:
