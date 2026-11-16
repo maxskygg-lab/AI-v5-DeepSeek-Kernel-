@@ -152,6 +152,152 @@ def cited_page_coverage(chunks, digest):
     return len(cited), len(cited & available), missing
 
 
+_COMPLETENESS_HINTS = (
+    "资料完整",
+    "完整吗",
+    "是否完整",
+    "齐全",
+    "缺页",
+    "漏页",
+    "资料够",
+    "够不够",
+    "覆盖哪些页",
+    "有没有缺",
+)
+
+
+def is_completeness_question(query):
+    """识别“资料完整吗”这类元问题，交给页级体检报告回答。"""
+    text = (query or "").lower()
+    return any(hint in text for hint in _COMPLETENESS_HINTS)
+
+
+def expand_to_pages(docs, chunks, max_pages=8, max_chars_per_page=4000, max_total_chars=30000):
+    """把检索到的碎片扩展成整页原文，减少“只给一段话”的断裂感。
+
+    同一页只保留一次；按传入顺序优先，超过预算则截断。
+    """
+    if not docs:
+        return []
+    from langchain_core.documents import Document
+
+    by_page = {}
+    for chunk in chunks:
+        paper = chunk.metadata.get("source_paper")
+        if not paper:
+            continue
+        by_page.setdefault((paper, _page(chunk)), []).append(chunk)
+
+    result = []
+    seen = set()
+    total_chars = 0
+    for doc in docs:
+        paper = doc.metadata.get("source_paper")
+        page = _page(doc)
+        key = (paper, page)
+        if key in seen:
+            continue
+        page_chunks = by_page.get(key)
+        if page_chunks:
+            page_chunks = sorted(page_chunks, key=_chunk_index)
+            parts = []
+            previous = ""
+            for chunk in page_chunks:
+                raw = chunk.page_content.replace("\n", " ").strip()
+                snippet = strip_overlap(previous, raw)
+                previous = raw
+                if snippet:
+                    parts.append(snippet)
+            text = "\n".join(parts).strip()
+        else:
+            text = doc.page_content.strip()
+        if not text:
+            continue
+        if len(text) > max_chars_per_page:
+            text = text[:max_chars_per_page] + "…"
+        if total_chars + len(text) > max_total_chars:
+            break
+        result.append(Document(page_content=text, metadata={**doc.metadata, "parent": True}))
+        seen.add(key)
+        total_chars += len(text)
+        if len(result) >= max_pages:
+            break
+    return result
+
+
+def _format_pages(pages, limit=10):
+    pages = list(pages)
+    if not pages:
+        return "无"
+    text = "、".join(f"P{p}" for p in pages[:limit])
+    if len(pages) > limit:
+        text += f" 等 {len(pages)} 页"
+    return text
+
+
+def format_manifest_report(papers, chunks, digests, manifests, topic_name):
+    """生成确定性的页级体检报告，供“资料完整吗”类问题使用。"""
+    lines = []
+    for paper in papers:
+        paper_chunks = [c for c in chunks if c.metadata.get("source_paper") == paper]
+        manifest = (manifests or {}).get(f"{topic_name}::{paper}")
+        if not manifest:
+            pages = sorted({_page(c) for c in paper_chunks})
+            manifest = {
+                "total_pages": max(pages, default=0),
+                "text_pages": pages,
+                "empty_pages": [],
+                "short_pages": [],
+                "garbled_pages": [],
+                "chunks": len(paper_chunks),
+                "reconstructed": True,
+            }
+        lines.append(f"《{paper}》")
+        if manifest.get("reconstructed"):
+            pages = manifest.get("text_pages") or []
+            span = f"P{pages[0]}–P{pages[-1]}" if pages else "无"
+            lines.append(
+                f"- 页级索引：旧数据，总页数未知；已入库 {len(pages)} 页（{span}），"
+                f"{manifest.get('chunks', 0)} 个 chunk"
+            )
+        else:
+            low_quality = len(manifest.get("short_pages") or []) + len(
+                manifest.get("garbled_pages") or []
+            )
+            lines.append(
+                f"- 页级索引：总页数 {manifest.get('total_pages', 0)}，"
+                f"有文本 {len(manifest.get('text_pages') or [])} 页，"
+                f"空页 {len(manifest.get('empty_pages') or [])} 页，"
+                f"低质量 {low_quality} 页，{manifest.get('chunks', 0)} 个 chunk"
+            )
+            if manifest.get("empty_pages"):
+                lines.append(
+                    f"- 空页：{_format_pages(manifest['empty_pages'])}"
+                    "（可能是图片/扫描页，需要 OCR）"
+                )
+            if manifest.get("garbled_pages"):
+                lines.append(f"- 疑似乱码：{_format_pages(manifest['garbled_pages'])}")
+            if manifest.get("short_pages"):
+                lines.append(f"- 文本过短：{_format_pages(manifest['short_pages'])}")
+        digest = (digests.get(paper) or {}).get("digest", "")
+        if digest:
+            cited_total, cited_matched, missing = cited_page_coverage(paper_chunks, digest)
+            if cited_total:
+                lines.append(
+                    f"- 摘要引用页：{cited_matched}/{cited_total} 有原文；"
+                    f"缺失 {_format_pages(missing)}"
+                )
+            missing_fields = [
+                line.strip()
+                for line in digest.splitlines()
+                if "论文未报告" in line or "资料未覆盖" in line
+            ]
+            if missing_fields:
+                lines.append("- 摘要中的缺失项：" + "；".join(missing_fields[:5]))
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def strip_overlap(previous, current, min_overlap=80, max_overlap=400):
     """去掉相邻切片之间因 chunk_overlap 产生的重复文本。"""
     if not previous:
@@ -202,7 +348,9 @@ def build_digest_prompt(paper, chunks, meta):
     lines = [
         "你是一名严谨的学术论文信息抽取助手。请只根据下面提供的论文片段，输出结构化摘要。",
         "要求：",
-        "1. 只使用片段中明确出现的信息，不得臆测或补全；确实缺失的字段写“资料未覆盖”。",
+        "1. 只使用片段中明确出现的信息，不得臆测或补全。"
+        "若片段明确说明论文未报告某项（如定性研究没有定量结果），写“论文未报告”；"
+        "否则写“资料未覆盖”。",
         "2. 每条结论后附页码，格式 [P12]；不要编造页码。",
         "3. 每个字段用 1-3 句话，保持紧凑。",
         "4. 请特别完整地提取基准数据集、SOTA 指标与局限性；片段中有数字时保留数字。",
@@ -255,11 +403,7 @@ def get_paper_digest(paper, chunks, api_key, ss_key="", with_meta=True):
         return cached
 
     try:
-        meta = (
-            _paper_meta(paper, ss_key)
-            if with_meta
-            else {"title": paper.replace(".pdf", "")}
-        )
+        meta = _paper_meta(paper, ss_key) if with_meta else {"title": paper.replace(".pdf", "")}
     except Exception as e:
         logger.debug("paper_meta_parse_failed paper=%s error=%s", paper, e)
         meta = {"title": paper.replace(".pdf", "")}
@@ -293,9 +437,7 @@ def get_paper_digest(paper, chunks, api_key, ss_key="", with_meta=True):
         "signature": signature,
     }
     cache[paper] = result
-    logger.info(
-        "paper_digest_ok paper=%s chunks=%d pages=%d", paper, len(selected), len(pages)
-    )
+    logger.info("paper_digest_ok paper=%s chunks=%d pages=%d", paper, len(selected), len(pages))
     return result
 
 

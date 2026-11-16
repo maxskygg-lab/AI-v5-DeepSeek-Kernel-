@@ -1,6 +1,5 @@
 """Tab 2：研读空间（单篇精读 / 多篇对比 / 自由问答）。"""
 
-import hashlib
 import uuid
 from datetime import datetime
 
@@ -9,13 +8,16 @@ import streamlit as st
 from services.context import (
     cited_page_coverage,
     collect_cited_chunks,
+    expand_to_pages,
     format_digests,
+    format_manifest_report,
     get_paper_digests,
-    strip_overlap,
+    is_completeness_question,
 )
 from services.llm import get_deepseek_llm
 from services.log import get_logger
 from services.notes import save_note_to_cloud
+from services.pdf import reconstruct_manifest_from_chunks
 from services.retrieval import hybrid_retrieve
 from services.semantic_scholar import fetch_ss_paper_details_by_title
 from services.vectorstore import active_topic_data
@@ -46,6 +48,32 @@ def render_read_tab(user_api_key, ss_api_key):
             st.caption("🎯 当前模式：**专注研读** (已屏蔽其他论文干扰)")
 
     st.divider()
+
+    # ── 资料体检：页级完整性（确定性数据，不经过 LLM） ──
+    if t["files"]:
+        with st.expander("🩺 资料体检（页级完整性）", expanded=False):
+            manifests = st.session_state.get("paper_manifests", {})
+            for paper in t["files"]:
+                manifest = manifests.get(f"{st.session_state.active_topic}::{paper}")
+                if not manifest:
+                    manifest = reconstruct_manifest_from_chunks(paper, t["chunks"])
+                if manifest.get("reconstructed"):
+                    pages = manifest.get("text_pages") or []
+                    span = f"P{pages[0]}–P{pages[-1]}" if pages else "无"
+                    st.caption(
+                        f"《{paper}》：旧数据，总页数未知；已入库 {len(pages)} 页（{span}），"
+                        f"{manifest.get('chunks', 0)} 个 chunk"
+                    )
+                else:
+                    low_quality = len(manifest.get("short_pages") or []) + len(
+                        manifest.get("garbled_pages") or []
+                    )
+                    st.caption(
+                        f"《{paper}》：总页数 {manifest.get('total_pages', 0)}，"
+                        f"有文本 {len(manifest.get('text_pages') or [])} 页，"
+                        f"空页 {len(manifest.get('empty_pages') or [])}，"
+                        f"低质量 {low_quality}，{manifest.get('chunks', 0)} 个 chunk"
+                    )
 
     # ── 多文献对比矩阵与溯源综述 ──
     if selected_scope == "🌐 全库综合 (对比/综述)" and len(t["files"]) > 0:
@@ -106,6 +134,13 @@ def render_read_tab(user_api_key, ss_api_key):
                                 digest,
                                 max_chunks=10 if len(matrix_papers) <= 3 else 6,
                             )
+                            cited = expand_to_pages(
+                                cited,
+                                t["chunks"],
+                                max_pages=8,
+                                max_chars_per_page=3500,
+                                max_total_chars=18000,
+                            )
                             if cited:
                                 cited_lines.append(f"【{p}】")
                                 for d in cited:
@@ -131,8 +166,9 @@ def render_read_tab(user_api_key, ss_api_key):
                             "### 任务一：结构化对比矩阵 (Markdown Table)\n"
                             "请严格提取各论文的核心特征，输出一个对比表格，**表头必须且只能包含以下五列："
                             "论文名称、创新点、基准数据集、SOTA 指标、局限性**。"
-                            "优先使用结构化摘要中的字段；若摘要标注“资料未覆盖”，再结合关键证据判断；"
-                            "确实没有才填写“未明确提及”，不要臆测。\n\n"
+                            "优先使用结构化摘要中的字段；若摘要明确写“论文未报告”，矩阵填“论文未报告”；"
+                            "只有摘要和引用页证据都缺失时才填“资料未覆盖”。"
+                            "不要因为摘要片段没有就判定整篇论文没有，也不要输出额外的资料覆盖审计。\n\n"
                             "### 任务二：带溯源的学术综述初稿\n"
                             "基于上述摘要与关键证据，撰写一段连贯的学术综述（约400-500字），"
                             "梳理这些文献的研究方法演进与优劣势。\n"
@@ -208,6 +244,7 @@ def render_read_tab(user_api_key, ss_api_key):
             full_response = ""
 
             try:
+                completeness = is_completeness_question(prompt)
                 # --- 核心优化 A：精准检索策略 ---
                 search_kwargs = {}
                 filter_rule = None
@@ -303,49 +340,47 @@ def render_read_tab(user_api_key, ss_api_key):
                                 )
 
                 # --- 核心优化 B：构建更智能的 Prompt ---
-                if not docs and not cited_docs:
+                if not docs and not cited_docs and not completeness:
                     full_response = "⚠️ 未在文档中利用混合管线检索到相关信息，请尝试更换关键词。"
                     message_placeholder.markdown(full_response)
                 else:
                     digest_text = format_digests(digests)
-                    # 合并“摘要引用页证据”与“问题检索证据”，按论文/页码/切片排序
-                    cited_keys = {
-                        hashlib.sha1(d.page_content.encode("utf-8")).hexdigest()
-                        for d in cited_docs
-                    }
-                    all_docs = []
-                    seen = set()
-                    for d in cited_docs + docs:
-                        key = hashlib.sha1(d.page_content.encode("utf-8")).hexdigest()
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        all_docs.append(d)
-                    all_docs.sort(
-                        key=lambda d: (
-                            str(d.metadata.get("source_paper", "")),
-                            int(d.metadata.get("page", 0) or 0),
-                            int(d.metadata.get("chunk_index", 0) or 0),
+                    # 把检索碎片扩展成整页，摘要引用页与检索页合并去重，统一成一个证据池
+                    evidence_docs = (
+                        []
+                        if completeness
+                        else expand_to_pages(
+                            cited_docs + docs,
+                            t["chunks"],
+                            max_pages=8 if selected_scope != "🌐 全库综合 (对比/综述)" else 12,
+                            max_chars_per_page=4000,
+                            max_total_chars=30000,
                         )
+                    )
+                    manifest_text = (
+                        format_manifest_report(
+                            digest_papers,
+                            t["chunks"],
+                            digests,
+                            st.session_state.get("paper_manifests", {}),
+                            st.session_state.active_topic,
+                        )
+                        if completeness
+                        else ""
                     )
 
                     context_text = ""
                     refs = []
-                    previous_by_paper = {}
                     ref_no = 0
-                    for d in all_docs:
+                    for d in evidence_docs:
                         src = d.metadata.get("source_paper", "未知")
-                        page = int(d.metadata.get("page", 0) or 0) + 1  # PyPDFLoader通常从0开始
-                        raw = d.page_content.replace("\n", " ").strip()
-                        snippet = strip_overlap(previous_by_paper.get(src, ""), raw)
-                        previous_by_paper[src] = raw
+                        page = int(d.metadata.get("page", 0) or 0) + 1
+                        snippet = d.page_content.replace("\n", " ").strip()
                         if not snippet:
                             continue
                         ref_no += 1
-                        key = hashlib.sha1(d.page_content.encode("utf-8")).hexdigest()
-                        tag = "摘要证据" if key in cited_keys else "检索证据"
-                        context_text += f"[资料{ref_no} | {tag} | {src} (P{page})]: {snippet}\n\n"
-                        refs.append(f"**[{ref_no}] {tag} | {src} (P{page})**: {snippet[:100]}...")
+                        context_text += f"[资料{ref_no} | {src} (P{page})]: {snippet}\n\n"
+                        refs.append(f"**[{ref_no}] {src} (P{page})**: {snippet[:100]}...")
 
                     ss_context = ""
                     if ss_data:
@@ -366,46 +401,65 @@ def render_read_tab(user_api_key, ss_api_key):
                         )
 
                     # 动态 System Prompt
-                    if selected_scope != "🌐 全库综合 (对比/综述)":
+                    if completeness:
+                        sys_prompt = (
+                            "用户询问资料完整性。以下是系统生成的页级体检报告（确定性数据）。\n"
+                            "要求：\n"
+                            "1. 只根据报告回答，不要编造报告中没有的页码或缺失项。\n"
+                            "2. 明确区分三件事：页级索引是否完整、摘要引用页是否有原文、"
+                            "论文本身是否未报告某项。\n"
+                            "3. 对用户当前任务给出结论：如果用于结构化对比/具体问答，说明是否够用；"
+                            "如果空页或低质量页影响结论，建议 OCR 或重新上传。\n"
+                            "4. 不要输出与报告无关的资料覆盖审计。\n\n"
+                            f"### 页级体检报告：\n{manifest_text}"
+                        )
+                        context_text = ""  # 体检问题不使用检索证据，避免模型再次审计
+                    elif selected_scope != "🌐 全库综合 (对比/综述)":
                         sys_prompt = (
                             f"你正在辅助用户精读论文《{selected_scope}》。\n"
-                            "以下有该论文的结构化摘要（基于全文代表性片段）和与问题相关的原文片段。\n"
+                            "以下是该论文的结构化摘要（基于代表性片段）和页码级原文证据。\n"
                             "要求：\n"
-                            "1. 先用结构化摘要建立整体理解，再用原文片段回答具体问题。\n"
+                            "1. 先用结构化摘要建立整体理解，再用原文证据回答具体问题。\n"
                             "2. 回答要深入、具体，多引用数据或具体算法步骤。\n"
                             "3. 如果资料中包含公式描述，请还原为 LaTeX 格式。\n"
                             "4. 引用时给出页码，严禁编造资料中不存在的内容。\n"
-                            "5. 证据标签中「摘要证据」是摘要引用页的原文，"
-                            "「检索证据」是与问题最相关的原文；回答具体结论时优先用摘要证据核对页码。"
+                            "5. 直接回答用户问题，不要输出资料完整性审计；"
+                            "只有具体事实在摘要和证据中都找不到时，才简短说明。\n"
+                            "6. 摘要引用页与检索页不重合是正常的，不要据此判断资料不完整。"
                             f"{ss_context}"
                             f"\n\n### 论文结构化摘要：\n{digest_text}"
                         )
                     else:
                         sys_prompt = (
-                            "你是一名学术顾问。以下有每篇论文的结构化摘要"
-                            "（基于全文代表性片段）和与问题相关的原文证据。\n"
+                            "你是一名学术顾问。以下是每篇论文的结构化摘要（基于代表性片段）"
+                            "和页码级原文证据。\n"
                             "要求：\n"
                             "1. 先用结构化摘要建立每篇论文的整体理解，再用原文证据回答具体问题。\n"
                             "2. 必须明确指出不同观点分别来自哪篇论文，并给出页码。\n"
                             "3. 如果涉及对比，请使用 Markdown 表格形式展示。\n"
-                            "4. 摘要中标注“资料未覆盖”的字段，不要臆测。\n"
-                            "5. 「摘要证据」是摘要引用页的原文，「检索证据」是与问题最相关的原文；"
-                            "两者都没有原文时，明确写「检索证据未覆盖」。"
+                            "4. 摘要中标注“论文未报告”的字段，不要臆测；"
+                            "只有摘要和证据都缺失时，才写“资料未覆盖”。\n"
+                            "5. 直接回答用户问题，不要输出资料完整性审计；"
+                            "页码不重合是正常的，不要据此判断资料不完整。"
                             f"\n\n### 论文结构化摘要：\n{digest_text}"
                         )
 
                     # --- 核心优化 C：调用 DeepSeek (流式) ---
-                    with st.expander(
-                        "📚 查看 AI (由混合管线重排推荐) 参考的原文片段", expanded=False
-                    ):
-                        st.markdown("\n\n".join(refs))
+                    if not completeness:
+                        with st.expander(
+                            "📚 查看 AI (由混合管线重排推荐) 参考的原文片段", expanded=False
+                        ):
+                            st.markdown("\n\n".join(refs))
 
                     llm = get_deepseek_llm(user_api_key, temperature=0.3)
 
+                    evidence_block = (
+                        "" if completeness else f"\n\n### 页码级原文证据：\n{context_text}"
+                    )
                     messages = [
                         {
                             "role": "system",
-                            "content": f"{sys_prompt}\n\n### 检索到的资料：\n{context_text}",
+                            "content": f"{sys_prompt}{evidence_block}",
                         },
                         {"role": "user", "content": prompt},
                     ]
@@ -429,9 +483,7 @@ def render_read_tab(user_api_key, ss_api_key):
                 }
 
             except Exception as e:
-                logger.exception(
-                    "chat_failed topic=%s error=%s", st.session_state.active_topic, e
-                )
+                logger.exception("chat_failed topic=%s error=%s", st.session_state.active_topic, e)
                 st.error(f"发生错误: {str(e)}")
 
     if st.session_state.pending_note:
@@ -462,4 +514,3 @@ def render_read_tab(user_api_key, ss_api_key):
                 else:
                     st.toast("笔记已保存到本页，云端同步失败，稍后自动重试", icon="⚠️")
                 st.rerun()
-

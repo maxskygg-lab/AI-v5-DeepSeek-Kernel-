@@ -86,6 +86,63 @@ def test_cited_page_coverage_reports_missing_pages():
     assert missing == [9]
 
 
+def test_is_completeness_question():
+    assert context.is_completeness_question("资料完整吗")
+    assert context.is_completeness_question("这些论文的资料齐全吗")
+    assert not context.is_completeness_question("GPT-4 在 GSM-8K 上的成绩是多少")
+
+
+def test_expand_to_pages_merges_same_page_and_dedupes():
+    chunks = [
+        _Chunk("page one part a", page=0, chunk_index=0),
+        _Chunk("page one part b", page=0, chunk_index=1),
+        _Chunk("page two", page=1, chunk_index=0),
+    ]
+    docs = [
+        _Chunk("hit page one", page=0),
+        _Chunk("hit page two", page=1),
+        _Chunk("hit page one again", page=0),
+    ]
+
+    pages = context.expand_to_pages(docs, chunks, max_pages=5)
+
+    assert len(pages) == 2
+    assert pages[0].metadata["page"] == 0
+    assert pages[0].metadata["parent"] is True
+    assert "page one part a" in pages[0].page_content
+    assert "page one part b" in pages[0].page_content
+    assert pages[1].page_content == "page two"
+
+
+def test_expand_to_pages_falls_back_to_fragment():
+    pages = context.expand_to_pages([_Chunk("only fragment", page=3)], [], max_pages=1)
+
+    assert len(pages) == 1
+    assert pages[0].page_content == "only fragment"
+
+
+def test_format_manifest_report_includes_empty_pages_and_citations():
+    chunks = [_Chunk("text", page=0, paper="p")]
+    manifests = {
+        "t::p": {
+            "total_pages": 2,
+            "text_pages": [1],
+            "empty_pages": [2],
+            "short_pages": [],
+            "garbled_pages": [],
+            "chunks": 1,
+        }
+    }
+    digests = {"p": {"digest": "## 关键证据\n[P1] 结果\n- 数据集：论文未报告"}}
+
+    text = context.format_manifest_report(["p"], chunks, digests, manifests, "t")
+
+    assert "总页数 2" in text
+    assert "空页：P2" in text
+    assert "摘要引用页：1/1" in text
+    assert "论文未报告" in text
+
+
 def test_format_digests_uses_meta_title():
     text = context.format_digests(
         {"paper.pdf": {"meta": {"title": "Readable Title"}, "digest": "Digest body"}}

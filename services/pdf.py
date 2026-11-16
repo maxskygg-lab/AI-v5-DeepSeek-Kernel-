@@ -17,6 +17,99 @@ logger = get_logger("pdf")
 # 解析产物至少要有这些字符才认为提取成功
 MIN_CHUNK_CHARS = 20
 
+# 页级体检阈值：过短或乱码比例过高都会进入提示
+MANIFEST_SHORT_CHARS = 80
+MANIFEST_GARBLED_RATIO = 0.05
+
+
+def _text_stats(text):
+    """返回 (长度, 有效字符数, 替换字符数)，用于识别空页/乱码页。"""
+    text = text or ""
+    stripped = text.strip()
+    good = sum(1 for ch in stripped if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+    bad = stripped.count("\ufffd")
+    return len(stripped), good, bad
+
+
+def format_pages(pages, limit=10):
+    """把页码列表压成一行，避免空页很多时提示过长。"""
+    pages = list(pages)
+    if not pages:
+        return "无"
+    text = "、".join(f"P{p}" for p in pages[:limit])
+    if len(pages) > limit:
+        text += f" 等 {len(pages)} 页"
+    return text
+
+
+def build_pdf_manifest(file_path, file_name, docs, total_pages=None):
+    """生成页级清单：总页数、有文本页、空页、过短页、疑似乱码页。
+
+    total_pages 允许注入，便于测试；生产环境从 PyMuPDF 读取真实页数。
+    """
+    if total_pages is None:
+        try:
+            import fitz
+
+            with fitz.open(file_path) as pdf:
+                total_pages = pdf.page_count
+        except Exception:
+            total_pages = max((_page_of_doc(d, i) + 1 for i, d in enumerate(docs)), default=0)
+
+    text_pages = set()
+    short_pages = set()
+    garbled_pages = set()
+    for index, doc in enumerate(docs):
+        page = _page_of_doc(doc, index) + 1
+        text = doc.page_content or ""
+        length, _good, bad = _text_stats(text)
+        if length == 0:
+            continue
+        text_pages.add(page)
+        if length < MANIFEST_SHORT_CHARS:
+            short_pages.add(page)
+        if bad and bad / max(1, length) > MANIFEST_GARBLED_RATIO:
+            garbled_pages.add(page)
+
+    all_pages = set(range(1, int(total_pages or 0) + 1))
+    return {
+        "file": file_name,
+        "total_pages": int(total_pages or 0),
+        "text_pages": sorted(text_pages),
+        "empty_pages": sorted(all_pages - text_pages),
+        "short_pages": sorted(short_pages),
+        "garbled_pages": sorted(garbled_pages),
+        "chunks": 0,
+        "dropped_chunks": 0,
+        "chars": sum(len((d.page_content or "").strip()) for d in docs),
+    }
+
+
+def reconstruct_manifest_from_chunks(file_name, chunks):
+    """旧数据没有 manifest 时，从已入库 chunk 反推一个下界清单。"""
+    paper_chunks = [c for c in chunks if c.metadata.get("source_paper") == file_name]
+    pages = sorted({_page_of_doc(c, 0) + 1 for c in paper_chunks})
+    return {
+        "file": file_name,
+        "total_pages": max(pages, default=0),
+        "text_pages": pages,
+        "empty_pages": [],
+        "short_pages": [],
+        "garbled_pages": [],
+        "chunks": len(paper_chunks),
+        "dropped_chunks": 0,
+        "chars": sum(len(c.page_content) for c in paper_chunks),
+        "reconstructed": True,
+    }
+
+
+def get_paper_manifest(topic_name, file_name):
+    return st.session_state.get("paper_manifests", {}).get(f"{topic_name}::{file_name}")
+
+
+def manifest_key(topic_name, file_name):
+    return f"{topic_name}::{file_name}"
+
 
 def download_arxiv_pdf_direct(arxiv_id):
     started = time.perf_counter()
@@ -111,9 +204,7 @@ def load_pdf_documents(file_path, file_name, topic_name):
             total_pages,
             nonempty_pages,
         )
-        docs = _merge_fitz_fallback(
-            docs, _extract_text_with_fitz(file_path, file_name, topic_name)
-        )
+        docs = _merge_fitz_fallback(docs, _extract_text_with_fitz(file_path, file_name, topic_name))
 
     # 若 pypdf 完全未能提取文字（如扫描版 PDF），回退到 PyMuPDF
     if not has_extractable_text(docs):
@@ -121,18 +212,26 @@ def load_pdf_documents(file_path, file_name, topic_name):
     return docs
 
 
-def split_documents(docs):
+def split_documents_with_stats(docs):
+    """切块并返回丢弃数量，便于页级体检说明“有没有静默丢内容”。"""
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=600, chunk_overlap=200, separators=["\n\n", "\n", "。", ".", " ", ""]
     )
     chunks = []
+    dropped = 0
     for index, chunk in enumerate(splitter.split_documents(docs)):
         if len(chunk.page_content.strip()) <= MIN_CHUNK_CHARS:
+            dropped += 1
             continue
         chunk.metadata["chunk_index"] = index
         chunks.append(chunk)
+    return chunks, dropped
+
+
+def split_documents(docs):
+    chunks, _ = split_documents_with_stats(docs)
     return chunks
 
 
@@ -142,20 +241,36 @@ def process_and_add_to_topic(file_path, file_name, api_key, topic_name=None):
     t = st.session_state.topics[topic_name]
     try:
         docs = load_pdf_documents(file_path, file_name, topic_name)
-        chunks = split_documents(docs)
+        manifest = build_pdf_manifest(file_path, file_name, docs)
+        chunks, dropped = split_documents_with_stats(docs)
+        manifest["chunks"] = len(chunks)
+        manifest["dropped_chunks"] = dropped
+        st.session_state.setdefault("paper_manifests", {})[
+            manifest_key(topic_name, file_name)
+        ] = manifest
 
         if not chunks:
             logger.warning(
-                "pdf_empty_text topic=%s file=%s elapsed_ms=%.0f",
+                "pdf_empty_text topic=%s file=%s pages=%d empty_pages=%d elapsed_ms=%.0f",
                 topic_name,
                 file_name,
+                manifest["total_pages"],
+                len(manifest["empty_pages"]),
                 (time.perf_counter() - started) * 1000,
             )
             st.error(
                 f"🚫 《{file_name}》未能提取到任何文字（可能是扫描版 PDF 或文件已损坏），已跳过入库，未加入可检索内容。"
+                f"体检结果：共 {manifest['total_pages']} 页，空页 {format_pages(manifest['empty_pages'])}。"
             )
             return False
         t["chunks"].extend(chunks)
+
+        if manifest["empty_pages"]:
+            st.warning(
+                f"《{file_name}》共 {manifest['total_pages']} 页，"
+                f"其中 {format_pages(manifest['empty_pages'])} 没有可提取文字（可能是图片/扫描页）。"
+                "这些页已记录在资料体检中，需要内容时可做 OCR。"
+            )
 
         batch = 10
         if not PINECONE_API_KEY:

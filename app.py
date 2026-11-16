@@ -55,6 +55,7 @@ defaults = {
     "notes_last_error": None,
     "preload_done_ids": set(),
     "paper_digests": {},
+    "paper_manifests": {},
 }
 for k, v in defaults.items():
     if k not in st.session_state:
