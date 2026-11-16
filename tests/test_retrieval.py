@@ -45,9 +45,7 @@ def test_hybrid_retrieve_covers_multiple_papers(monkeypatch):
     monkeypatch.setattr(retrieval, "get_bm25", lambda *a, **k: _BM25())
     monkeypatch.setattr(retrieval, "get_cross_encoder", lambda: _CrossEncoder())
 
-    result = retrieval.hybrid_retrieve(
-        "query", docs, _DB(), {"k": 15}, "cache", cross_paper=True
-    )
+    result = retrieval.hybrid_retrieve("query", docs, _DB(), {"k": 15}, "cache", cross_paper=True)
 
     sources = {d.metadata["source_paper"] for d in result}
     assert len(result) == 6

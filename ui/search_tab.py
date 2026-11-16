@@ -386,7 +386,9 @@ def render_search_tab(user_api_key, ss_api_key):
                                 try:
                                     st.session_state.score_cache[key] = future.result()
                                 except Exception as e:
-                                    logger.debug("paper_score_task_failed title=%s error=%s", key, e)
+                                    logger.debug(
+                                        "paper_score_task_failed title=%s error=%s", key, e
+                                    )
                                     st.session_state.score_cache[key] = "（打分失败）"
                 st.success(f"✅ 前 {score_num} 篇论文已打分完毕！")
                 time.sleep(2)
@@ -621,4 +623,3 @@ def render_search_tab(user_api_key, ss_api_key):
                     st.rerun()
                 else:
                     st.info("✨ 到底啦。")
-

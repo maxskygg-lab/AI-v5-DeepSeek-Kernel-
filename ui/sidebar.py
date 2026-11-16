@@ -93,7 +93,9 @@ def render_sidebar(user_api_key, ss_api_key):
                 with c2:
                     if st.button("🗑️", key=f"del_{f}"):
                         ts["files"].remove(f)
-                        ts["chunks"] = [c for c in ts["chunks"] if c.metadata.get("source_paper") != f]
+                        ts["chunks"] = [
+                            c for c in ts["chunks"] if c.metadata.get("source_paper") != f
+                        ]
                         if ts["db"]:
                             try:
                                 ts["db"].delete(filter={"source_paper": f})

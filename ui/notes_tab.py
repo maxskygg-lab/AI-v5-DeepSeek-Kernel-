@@ -95,4 +95,3 @@ def render_notes_tab():
             else:
                 st.session_state.notes = []
             st.rerun()
-
