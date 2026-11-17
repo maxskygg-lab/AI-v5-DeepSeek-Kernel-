@@ -591,8 +591,6 @@ def render_search_tab(user_api_key, ss_api_key):
                             key=lambda x: x["citations"] or 0, reverse=True
                         )
                     elif "质量优先" in sort_mode or "综合" in sort_mode:
-                        import math
-
                         current_year = datetime.now().year
                         for idx, item in enumerate(st.session_state.search_results):
                             rel_score = item.get("sim_score", 50.0)
