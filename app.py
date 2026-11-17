@@ -24,6 +24,7 @@ for _module in _REQUIRED_MODULES:
 from services.config import SS_API_KEY, USER_API_KEY
 from services.log import get_logger, setup_logging
 from services.notes import retry_unsynced_notes, sync_notes_from_cloud
+from services.topics import load_topics_from_cloud
 from ui.layout import setup_page
 from ui.notes_tab import render_notes_tab
 from ui.read_tab import render_read_tab
@@ -56,10 +57,16 @@ defaults = {
     "preload_done_ids": set(),
     "paper_digests": {},
     "paper_manifests": {},
+    "topics_loaded": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# --- 启动时恢复云端主题列表（每个会话一次；失败不阻塞应用启动） ---
+if not st.session_state.get("topics_loaded"):
+    load_topics_from_cloud()
+    st.session_state["topics_loaded"] = True
 
 # --- 启动时同步云端笔记（每个会话一次；失败不阻塞应用启动） ---
 if not st.session_state.get("notes_synced"):

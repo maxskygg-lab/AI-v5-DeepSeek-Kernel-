@@ -19,6 +19,7 @@ from services.embeddings import get_embeddings_model
 from services.llm import get_one_line_contribution, get_paper_score
 from services.log import get_logger
 from services.pdf import download_arxiv_pdf_direct, process_and_add_to_topic
+from services.topics import save_topics_to_cloud
 from services.semantic_scholar import (
     fetch_graph_data,
     preload_top_graphs,
@@ -299,6 +300,7 @@ def render_search_tab(user_api_key, ss_api_key):
                                         user_api_key,
                                         topic_name=target_topic,
                                     ):
+                                        save_topics_to_cloud()
                                         st.success("✅ 入库成功！")
                                         st.balloons()
                                 except Exception as e:
@@ -540,8 +542,9 @@ def render_search_tab(user_api_key, ss_api_key):
                         with st.spinner("下载解析..."):
                             try:
                                 pdf_path = download_arxiv_pdf_direct(res.entry_id)
-                                process_and_add_to_topic(pdf_path, res.title, user_api_key)
-                                st.success("入库成功！")
+                                if process_and_add_to_topic(pdf_path, res.title, user_api_key):
+                                    save_topics_to_cloud()
+                                    st.success("入库成功！")
                             except Exception as e:
                                 st.error(str(e))
                 with b3:

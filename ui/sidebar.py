@@ -7,6 +7,7 @@ import streamlit as st
 
 from services.log import get_logger
 from services.pdf import process_and_add_to_topic
+from services.topics import save_topics_to_cloud
 from services.vectorstore import (
     active_topic_data,
     make_namespace,
@@ -16,6 +17,11 @@ from services.vectorstore import (
 )
 
 logger = get_logger("ui.sidebar")
+
+
+def _persist_topics():
+    if not save_topics_to_cloud():
+        st.warning("主题列表云端保存失败，刷新后可能丢失；请检查 PINECONE_API_KEY 或网络。")
 
 
 def render_sidebar(user_api_key, ss_api_key):
@@ -41,6 +47,7 @@ def render_sidebar(user_api_key, ss_api_key):
         if chosen != st.session_state.active_topic:
             st.session_state.active_topic = chosen
             st.session_state.selected_scope = "🌐 对比所有论文"
+            _persist_topics()
             st.rerun()
 
         cn, ca = st.columns([3, 1])
@@ -52,12 +59,14 @@ def render_sidebar(user_api_key, ss_api_key):
                 if nm not in st.session_state.topics:
                     st.session_state.topics[nm] = {"files": [], "chunks": [], "db": None}
                     st.session_state.active_topic = nm
+                    _persist_topics()
                     st.rerun()
 
         if len(st.session_state.topics) > 1:
             if st.button(f"🗑️ 删除「{st.session_state.active_topic}」"):
                 del st.session_state.topics[st.session_state.active_topic]
                 st.session_state.active_topic = list(st.session_state.topics.keys())[0]
+                _persist_topics()
                 st.rerun()
 
         ts = active_topic_data()
@@ -131,7 +140,8 @@ def render_sidebar(user_api_key, ss_api_key):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(uploaded_file.getvalue())
                     path = tmp.name
-                process_and_add_to_topic(path, uploaded_file.name, user_api_key)
+                if process_and_add_to_topic(path, uploaded_file.name, user_api_key):
+                    _persist_topics()
                 os.remove(path)
                 st.rerun()
 
