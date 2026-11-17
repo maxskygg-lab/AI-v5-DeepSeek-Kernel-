@@ -256,9 +256,12 @@ def format_manifest_report(papers, chunks, digests, manifests, topic_name):
         if manifest.get("reconstructed"):
             pages = manifest.get("text_pages") or []
             span = f"P{pages[0]}–P{pages[-1]}" if pages else "无"
+            page_set = set(pages)
+            gaps = [p for p in range(pages[0], pages[-1] + 1) if p not in page_set] if pages else []
+            gap_text = "未发现中间缺页" if not gaps else f"中间缺页 {_format_pages(gaps)}"
             lines.append(
-                f"- 页级索引：旧数据，总页数未知；已入库 {len(pages)} 页（{span}），"
-                f"{manifest.get('chunks', 0)} 个 chunk"
+                f"- 页级索引：旧数据，按已入库 chunk 推断覆盖 {span}，{gap_text}；"
+                f"总页数需重新上传确认；{manifest.get('chunks', 0)} 个 chunk"
             )
         else:
             low_quality = len(manifest.get("short_pages") or []) + len(

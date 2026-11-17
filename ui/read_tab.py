@@ -60,9 +60,20 @@ def render_read_tab(user_api_key, ss_api_key):
                 if manifest.get("reconstructed"):
                     pages = manifest.get("text_pages") or []
                     span = f"P{pages[0]}–P{pages[-1]}" if pages else "无"
+                    page_set = set(pages)
+                    gaps = (
+                        [p for p in range(pages[0], pages[-1] + 1) if p not in page_set]
+                        if pages
+                        else []
+                    )
+                    gap_text = (
+                        "未发现中间缺页"
+                        if not gaps
+                        else "中间缺页 " + "、".join(f"P{p}" for p in gaps)
+                    )
                     st.caption(
-                        f"《{paper}》：旧数据，总页数未知；已入库 {len(pages)} 页（{span}），"
-                        f"{manifest.get('chunks', 0)} 个 chunk"
+                        f"《{paper}》：按已入库 chunk 推断覆盖 {span}，{gap_text}；"
+                        f"{manifest.get('chunks', 0)} 个 chunk。总页数需重新上传确认。"
                     )
                 else:
                     low_quality = len(manifest.get("short_pages") or []) + len(
