@@ -22,10 +22,10 @@ jobs:
           pip install black pyflakes pytest streamlit numpy pandas requests
 
       - name: Check formatting
-        run: black --check --line-length 100 app.py services ui tests
+        run: black --check --line-length 100 app.py services ui tests eval
 
       - name: Static check
-        run: pyflakes app.py services ui tests
+        run: pyflakes app.py services ui tests eval
 
       - name: Unit tests
         run: pytest -q

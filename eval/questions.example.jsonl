@@ -1,0 +1,3 @@
+{"id": "example-1", "topic": "default_topic", "question": "这篇论文的主要贡献是什么？", "expected": [{"paper": "your-paper.pdf", "pages": [1, 2]}]}
+{"id": "example-2", "topic": "default_topic", "paper": "your-paper.pdf", "question": "论文使用了什么数据集？", "expected": [{"paper": "your-paper.pdf", "pages": [4, 5]}]}
+{"id": "example-3", "topic": "default_topic", "question": "各篇论文在方法上有何差异？", "expected": [{"paper": "paper-a.pdf", "pages": [3]}, {"paper": "paper-b.pdf", "pages": [2]}]}

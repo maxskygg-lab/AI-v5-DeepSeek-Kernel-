@@ -21,9 +21,7 @@ _PAGE_FIELDS = ("text_pages", "empty_pages", "short_pages", "garbled_pages")
 
 
 def _manifests_namespace():
-    return "manifests-" + hashlib.sha1(
-        f"{get_workspace_id()}:manifests".encode()
-    ).hexdigest()[:32]
+    return "manifests-" + hashlib.sha1(f"{get_workspace_id()}:manifests".encode()).hexdigest()[:32]
 
 
 def manifest_vector_id(topic_name, file_name):
@@ -118,9 +116,7 @@ def load_manifests_from_cloud():
             file_name = str(md.get("file") or "")
             if not topic_name or not file_name:
                 continue
-            manifests.setdefault(
-                f"{topic_name}::{file_name}", _metadata_to_manifest(md)
-            )
+            manifests.setdefault(f"{topic_name}::{file_name}", _metadata_to_manifest(md))
             loaded += 1
 
         logger.debug(
