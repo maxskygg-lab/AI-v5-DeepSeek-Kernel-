@@ -7,7 +7,7 @@ import streamlit as st
 
 from services.log import get_logger
 from services.pdf import process_and_add_to_topic
-from services.topics import save_topics_to_cloud
+from services.topics import discover_topics_from_cloud, save_topics_to_cloud
 from services.vectorstore import (
     active_topic_data,
     make_namespace,
@@ -19,9 +19,8 @@ from services.vectorstore import (
 logger = get_logger("ui.sidebar")
 
 
-def _persist_topics():
-    if not save_topics_to_cloud():
-        st.warning("主题列表云端保存失败，刷新后可能丢失；请检查 PINECONE_API_KEY 或网络。")
+def _persist_topics(removed=None):
+    save_topics_to_cloud(removed=removed)
 
 
 def render_sidebar(user_api_key, ss_api_key):
@@ -64,10 +63,30 @@ def render_sidebar(user_api_key, ss_api_key):
 
         if len(st.session_state.topics) > 1:
             if st.button(f"🗑️ 删除「{st.session_state.active_topic}」"):
-                del st.session_state.topics[st.session_state.active_topic]
+                deleted = st.session_state.active_topic
+                del st.session_state.topics[deleted]
                 st.session_state.active_topic = list(st.session_state.topics.keys())[0]
-                _persist_topics()
+                _persist_topics(removed=[deleted])
                 st.rerun()
+
+        sync = st.session_state.get("topics_sync")
+        if sync:
+            if sync.get("ok"):
+                st.caption(f"☁️ 主题同步：{sync.get('action')} {sync.get('count', 0)} 个")
+            else:
+                st.caption(f"⚠️ 主题同步失败：{sync.get('error') or '未知错误'}")
+
+        if st.button(
+            "🔎 从云端发现已有主题",
+            help="扫描已入库论文的 topic 元数据，找回未出现在主题列表中的主题",
+        ):
+            with st.spinner("正在扫描云端主题..."):
+                found = discover_topics_from_cloud()
+            if found:
+                st.success(f"发现 {len(found)} 个主题：{', '.join(found[:5])}")
+                st.rerun()
+            else:
+                st.info("没有发现新的主题。")
 
         ts = active_topic_data()
         # 启动时从云端自动恢复一次本主题的已入库论文（重开页面可继续研读）
