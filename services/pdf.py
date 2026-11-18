@@ -9,6 +9,7 @@ import streamlit as st
 
 from .config import PINECONE_API_KEY
 from .log import get_logger
+from .manifests import save_manifest_to_cloud
 from .utils import get_pure_arxiv_id
 from .vectorstore import get_vectorstore, make_namespace
 
@@ -294,6 +295,7 @@ def process_and_add_to_topic(file_path, file_name, api_key, topic_name=None):
         st.session_state.chat_history.append(
             {"role": "system_notice", "content": f"📚 《{file_name}》已加入主题「{topic_name}」。"}
         )
+        save_manifest_to_cloud(topic_name, file_name, manifest)
         logger.info(
             "paper_ingested topic=%s file=%s chunks=%d elapsed_ms=%.0f",
             topic_name,

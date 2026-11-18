@@ -23,6 +23,7 @@ for _module in _REQUIRED_MODULES:
 
 from services.config import SS_API_KEY, USER_API_KEY
 from services.log import get_logger, setup_logging
+from services.manifests import load_manifests_from_cloud
 from services.notes import retry_unsynced_notes, sync_notes_from_cloud
 from services.topics import load_topics_from_cloud
 from ui.layout import setup_page
@@ -58,6 +59,7 @@ defaults = {
     "paper_digests": {},
     "paper_manifests": {},
     "topics_loaded": False,
+    "manifests_loaded": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -67,6 +69,11 @@ for k, v in defaults.items():
 if not st.session_state.get("topics_loaded"):
     load_topics_from_cloud()
     st.session_state["topics_loaded"] = True
+
+# --- 启动时恢复页级清单（每个会话一次；失败不阻塞应用启动） ---
+if not st.session_state.get("manifests_loaded"):
+    load_manifests_from_cloud()
+    st.session_state["manifests_loaded"] = True
 
 # --- 启动时同步云端笔记（每个会话一次；失败不阻塞应用启动） ---
 if not st.session_state.get("notes_synced"):
